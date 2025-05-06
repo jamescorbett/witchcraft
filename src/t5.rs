@@ -35,10 +35,6 @@ fn default_is_decoder() -> bool {
     false
 }
 
-fn default_use_cache() -> bool {
-    true
-}
-
 fn default_tie_word_embeddings() -> bool {
     true
 }
@@ -110,11 +106,8 @@ pub struct Config {
     #[serde(default = "default_is_decoder")]
     pub is_decoder: bool,
     pub is_encoder_decoder: bool,
-    #[serde(default = "default_use_cache")]
-    pub use_cache: bool,
     pub pad_token_id: usize,
     pub eos_token_id: usize,
-    pub decoder_start_token_id: Option<usize>,
 }
 
 impl Default for Config {
@@ -139,10 +132,8 @@ impl Default for Config {
             tie_word_embeddings: true,
             is_decoder: false,
             is_encoder_decoder: true,
-            use_cache: true,
             pad_token_id: 0,
             eos_token_id: 1,
-            decoder_start_token_id: Some(0),
         }
     }
 }
