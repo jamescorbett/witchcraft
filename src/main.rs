@@ -413,7 +413,7 @@ impl DB {
 
     fn make_query(self: &Self) -> SQLResult<Query> {
         let stmt = self.connection.prepare("SELECT
-            document.filename,document.hash,document.body
+            document.hash,document.body
             FROM document
             LEFT JOIN chunk ON document.hash = chunk.hash
             WHERE chunk.hash IS NULL
