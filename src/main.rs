@@ -29,11 +29,11 @@ struct T5ModelBuilder {
 impl T5ModelBuilder {
     pub fn load() -> Result<(Self, Tokenizer)> {
         let device = Device::new_metal(0)?;
-        let path = PathBuf::from(r"/Users/jhansen/src/xtr-warp/foo.safetensors");
+        let path = PathBuf::from(r"xtr.safetensors");
         let weights_filename = vec![path];
-        let config = std::fs::read_to_string("/Users/jhansen/src/xtr-warp/xtr-base-en/config.json")?;
+        let config = std::fs::read_to_string("xtr-base-en/config.json").unwrap();
         let config: t5::Config = serde_json::from_str(&config)?;
-        let tokenizer = Tokenizer::from_file("/Users/jhansen/src/xtr-warp/xtr-base-en/tokenizer.json").map_err(E::msg)?;
+        let tokenizer = Tokenizer::from_file("xtr-base-en/tokenizer.json").map_err(E::msg).unwrap();
         Ok((
             Self {
                 device,
