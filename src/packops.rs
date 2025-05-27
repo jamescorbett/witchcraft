@@ -87,7 +87,7 @@ impl TensorPackOps for Tensor {
     }
 
     fn to_f32_bytes(&self) -> Result<Vec<u8>> {
-        let floats: Vec<f32> = self.to_vec1::<f32>()?;
+        let floats: Vec<f32> = self.flatten_all()?.to_vec1::<f32>()?;
         let mut bytes = Vec::with_capacity(floats.len() * 4);
 
         for f in floats {
