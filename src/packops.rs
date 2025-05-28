@@ -3,6 +3,8 @@ use candle_core::{Device, Tensor};
 use anyhow::{Result};
 
 pub trait TensorPackOps {
+    fn compand(&self) -> Result<Tensor>;
+    fn inv_compand(&self) -> Result<Tensor>;
     fn quantize(&self, bits: u32) -> Result<Tensor>;
     fn dequantize(&self, bits: u32) -> Result<Tensor>;
     fn from_q4_bytes(buffer: &[u8], cols: usize, device: &Device) -> Result<Tensor>;
@@ -13,6 +15,35 @@ pub trait TensorPackOps {
 }
 
 impl TensorPackOps for Tensor {
+
+    /* mu-law companding to improve quantization of residuals. Scale input by 4 to expand
+      to full [-1;1] range, as empirically residuals of normalized embeddings rarely exceed
+      [-0.26:0.26] range.
+
+      The inverse operation is really slow, we should use a table and fold that into the dot
+      product calculations, like is done in the WARP paper.
+
+      See also https://en.wikipedia.org/wiki/%CE%9C-law_algorithm
+      */
+
+    fn compand(&self) -> Result<Tensor> {
+        let scale_param = 4.0;
+        let companding_param = 255.0;
+        let inv_denominator = 1.0f64 / (1.0f64 + companding_param).ln();
+        let x = (self * scale_param)?;
+        Ok( (&x.sign()? * (((&x.abs()? * companding_param)? + 1.0)?.log()? * inv_denominator)?)? )
+    }
+
+    fn inv_compand(&self) -> Result<Tensor> {
+        let inv_scale_param = 1.0 / 4.0;
+        let companding_param = 255.0;
+        let inv_companding_param = 1.0 / companding_param;
+        let ones = Tensor::ones_like(&self)?;
+        let abs = self.abs()?;
+        let sign = self.sign()?;
+        let scaled = (sign * (((&ones + companding_param)?.pow(&abs)? - 1.0)? * inv_companding_param)?)?;
+        Ok((&scaled * inv_scale_param)?)
+    }
 
     fn quantize(&self, bits: u32) -> Result<Tensor> {
         let range = 1 << bits;
@@ -71,6 +102,13 @@ impl TensorPackOps for Tensor {
     fn to_q4_bytes(&self) -> Result<Vec<u8>> {
         let data = self.to_vec2::<f32>()?;
         let flat: Vec<f32> = data.into_iter().flatten().collect();
+        /*
+        let mut hist: [u32; 16] = [0; 16];
+        for i in &flat {
+            hist[*i as usize] += 1;
+        }
+        println!("hist {:?}", hist);
+        */
 
         assert!(
             flat.len() % 2 == 0,
@@ -104,5 +142,20 @@ impl TensorPackOps for Tensor {
             bytes.extend_from_slice(&u.to_ne_bytes());
         }
         Ok(bytes)
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compand() -> Result<()> {
+        let x1 = Tensor::randn(0f32, 0.26f32, 200, &Device::Cpu)?;
+        let x2 = x1.compand()?.inv_compand()?;
+        let mse = (&x2 - &x1)?.powf(2.0)?.sum_all()?.to_scalar::<f32>()?;
+        assert!(mse < 0.001);
+        Ok(())
     }
 }
