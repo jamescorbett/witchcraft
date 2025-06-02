@@ -47,19 +47,17 @@ impl TensorPackOps for Tensor {
 
     fn quantize(&self, bits: u32) -> Result<Tensor> {
         let range = 1 << bits;
-        let qmin = 0.0;
         let qmax = (range - 1) as f64;
-        let scale1 = (range as f64) / 2.0;
-        let zp = (qmax - qmin) / 2.0;
-        Ok(((self * scale1)? + zp)?.round()?.clamp(qmin, qmax)?)
+        let scale1 = qmax / 2.0;
+        let zp = qmax / 2.0;
+        Ok(((self * scale1)? + zp)?.round()?.clamp(0.0, qmax)?)
     }
 
     fn dequantize(&self, bits: u32) -> Result<Tensor> {
         let range = 1 << bits;
-        let qmin = 0.0;
         let qmax = (range - 1) as f64;
-        let scale2 = 2.0 / (range as f64);
-        let zp = (qmax - qmin) / 2.0;
+        let scale2 = 2.0 / ((range - 1) as f64);
+        let zp = qmax / 2.0;
         Ok(((self - zp)? * scale2)?)
     }
 
@@ -151,6 +149,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_dequantize() -> Result<()> {
+        let x = Tensor::arange(0.0f32, 16.0f32, &Device::Cpu)?;
+        println!("x={}", x);
+        let x = x.dequantize(4)?;
+        println!("x={}", x);
+        Ok(())
+    }
     fn test_compand() -> Result<()> {
         let x1 = Tensor::randn(0f32, 0.26f32, 200, &Device::Cpu)?;
         let x2 = x1.compand()?.inv_compand()?;
