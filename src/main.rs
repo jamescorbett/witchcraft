@@ -205,33 +205,43 @@ fn match_centroids(
     for i in topk_clusters {
         let (document_indices, document_embeddings) = bucket_query.point3(i)?;
         let center = centers.get(i as usize)?;
-        let center = center.to_device(&device)?;
 
         let document_indices = u8_to_vec_u32(&document_indices);
 
-        let residuals = Tensor::from_q4_bytes(&document_embeddings, 128, &device)?.dequantize(4)?.inv_compand()?;
+        //let residuals = Tensor::from_q4_bytes(&document_embeddings, 128, &device)?.dequantize(4)?.inv_compand()?;
+        let residuals = Tensor::from_companded_q4_bytes(&document_embeddings, 128, &device)?;
         let embeddings = residuals.broadcast_add(&center)?;
+        all_document_embeddings.push(embeddings);
 
         let (m, _) = residuals.dims2()?;
         for j in 0..m {
-            heap.push((document_indices[j], all_document_embeddings.len()));
-            all_document_embeddings.push(embeddings.get(j)?);
+            heap.push((document_indices[j], heap.len()));
         }
     }
+    println!("heap fill took {} ms.", now.elapsed().as_millis());
+    let now = std::time::Instant::now();
 
-    let all_document_embeddings = Tensor::stack(all_document_embeddings.as_slice(), 1)?;
+    let all_document_embeddings = Tensor::cat(&all_document_embeddings, 0).unwrap();
     let all_document_embeddings = all_document_embeddings.to_device(query_embeddings.device())?;
 
-    let sim = query_embeddings.matmul(&all_document_embeddings)?.transpose(0, 1)?;
+    println!("tensor stacking took {} ms.", now.elapsed().as_millis());
+
+    let now = std::time::Instant::now();
+    let sim = query_embeddings.matmul(&all_document_embeddings.t()?)?.transpose(0, 1).unwrap();
     let sim = sim.to_device(&Device::Cpu)?;
+
+    println!("sim mmul took {} ms.", now.elapsed().as_millis());
+    let now = std::time::Instant::now();
 
     let mut last = std::u32::MAX;
     let mut current = Tensor::zeros((n,), DType::F32, &Device::Cpu)?;
 
     let mut heap2 = MinHeap::new();
+    let mut unique_docs = 0;
     while let Some((idx, i)) = heap.pop() {
 
         if last != idx || heap.len() == 0 {
+            unique_docs += 1;
             let score = current.mean(0)?.to_scalar::<f32>()?;
             if score >= cutoff {
                 let score_as_u32 = (1000.0 * score) as u32;
@@ -257,7 +267,7 @@ fn match_centroids(
 
         last = idx;
     }
-    println!("scoring clusters took {} ms.", now.elapsed().as_millis());
+    println!("scoring {} documents took {} ms.", unique_docs, now.elapsed().as_millis());
     println!("");
 
     let mut filenames = vec![];
@@ -279,7 +289,7 @@ fn match_centroids(
         filenames.push(filename);
 
     }
-    println!("filenames {:?}", filenames);
+    //println!("filenames {:?}", filenames);
 
     Ok(filenames)
 }
