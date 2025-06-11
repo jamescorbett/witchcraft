@@ -63,7 +63,7 @@ fn kmeans(data: &Tensor, k: usize, max_iter: usize, device: &Device) -> Result<(
     let total : u64 = (max_iter * k).try_into().unwrap();
     let bar = ProgressBar::new(total);
 
-    let mut rng = SmallRng::seed_from_u64(0);
+    let mut rng = rand::rng();
     let centroid_idx = rand::seq::index::sample(&mut rng, m, k).into_vec();
     let centroid_idx: Vec<u32> = centroid_idx.iter().map(|&i| i as u32).collect();
 
