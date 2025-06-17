@@ -83,20 +83,3 @@ There are also versions of these commands to run over tab-separate CSV files,
 useful for benchmarking. Please refer to the source code, or see the
 nfcorpus-score.sh and scifact-score.sh scripts for examples of doing this
 with datasets from BEIR.
-
-## Caveats ##
-
-Currently the vector compression that XTR-Warp uses is not implemented,
-and we also keep the document vectors around outside the index, so the
-mydb.sqlite file will get quite large. This is work in progress, but 
-in general the index is going to need more space that than the raw
-indexed text, due to storing a full embedding per token of input.
-
-XTR-Warp needs three hyperparameters to be tuned for the dataset size,
-
-* k in k-means
-* k' which is the number of nearby centroids to oversample on lookup
-* t' which determines the cumulative cluster size from where scores
-  are imputed
-
-These are currently all hardcoded to work well only with nfcorpus.
