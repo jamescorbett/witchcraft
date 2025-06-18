@@ -651,16 +651,6 @@ impl DB {
         Ok(Query { stmt })
     }
 
-    fn make_query(self: &Self) -> SQLResult<Query> {
-        let stmt = self.connection.prepare("SELECT
-            document.hash,document.body
-            FROM document
-            LEFT JOIN chunk ON document.hash = chunk.hash
-            WHERE chunk.hash IS NULL
-            ORDER BY filename")?;
-        Ok(Query { stmt })
-    }
-
     fn make_bucket_center_query(self: &Self) -> SQLResult<Query> {
         let stmt = self.connection.prepare("SELECT id,length(indices)/4,center FROM bucket ORDER BY id")?;
         Ok(Query { stmt })
@@ -750,7 +740,13 @@ fn main() -> Result<()> {
 
     } else if args.len() == 2 && &args[1] == "embed" {
 
-        let mut query = db.make_query().unwrap();
+        let mut query = db.query("SELECT
+            document.hash,document.body
+            FROM document
+            LEFT JOIN chunk ON document.hash = chunk.hash
+            WHERE chunk.hash IS NULL
+            ORDER BY filename").unwrap();
+
         let embedding_iter = Gatherer::new(&mut query, &embedder);
         for (hash, embeddings) in embedding_iter {
             println!("for hash {} {:?}", hash, embeddings.dims2().unwrap());
@@ -761,11 +757,6 @@ fn main() -> Result<()> {
     } else if args.len() == 2 && &args[1] == "index" {
 
         db.execute("DELETE from bucket").unwrap();
-
-        let chunks_count = db.query("SELECT count(hash) FROM chunk")?.point((), |row| {
-                Ok( row.get::<_, f32>(0)?,)
-            }).unwrap();
-        println!("chunks_count {}", chunks_count);
 
         let mut kmeans_query1 = db.query("SELECT chunk.embedding FROM chunk")?;
         let mut total_embeddings = 0;
