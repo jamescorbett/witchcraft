@@ -867,7 +867,7 @@ fn main() -> Result<()> {
 
         println!("Doing semantic search for: {}", q);
         let qe = embedder.embed(q)?.get(0)?;
-        let sem_matches = match_centroids(&db, &qe, 0.5, 10).unwrap();
+        let sem_matches = match_centroids(&db, &qe, 0.75, 10).unwrap();
         let sem_idxs: Vec<u32> = sem_matches.iter().map(|&(_, idx)| idx).collect();
         println!("semantic search found {} matches", sem_idxs.len());
 
