@@ -957,8 +957,12 @@ pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
 
     let now = std::time::Instant::now();
     let log2_k = (16.0 * (total_embeddings as f64).sqrt()).log(2.0).floor() as u32;
-    let k = 1 << log2_k;
+    let mut  k = 1 << log2_k;
     println!("total_embeddings={} k={}", total_embeddings, k);
+    let (m, _) = matrix.dims2()?;
+    if m < k {
+        k = m / 4;
+    }
     let (centers, idxs) = kmeans(&matrix, k as usize, 5, &device)?;
     println!("kmeans took {} ms.", now.elapsed().as_millis());
     println!("idxs {}", idxs);
