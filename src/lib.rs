@@ -8,13 +8,14 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use std::{
-    sync::{LazyLock, mpsc},
+    sync::{mpsc, LazyLock},
     thread::{self, JoinHandle},
 };
 
 #[derive(Debug)]
 pub struct Indexer {
     tx: mpsc::Sender<Job>,
+    db_name: String,
     _handle: JoinHandle<()>,
 }
 
@@ -22,28 +23,36 @@ static INDEXER: LazyLock<Indexer> = LazyLock::new(|| {
     Indexer::new()
 });
 
-type Job = String;
+type Job = (String, String, String);
 
 impl Indexer {
     pub fn new() -> Self {
         let (tx, rx) = mpsc::channel::<Job>();
+        let db_name = "mydb.sqlite";
+        let db = warp::DB::new(db_name);
         let handle = thread::spawn(move || {
-            let db = warp::DB::new("mydb.sqlite");
             let device = Device::new_metal(0).unwrap();
             while let Ok(job) = rx.recv() {
-                println!("got job {}", job);
-                if job == "index" {
+                let (command, arg1, arg2) = job;
+                println!("got job {}", command);
+                if command == "add" {
+                    warp::add_doc_from_string(&db, &arg1, &arg2).unwrap();
+                } else if command == "index" {
                     let count = warp::count_unindexed_chunks(&db).unwrap();
                     println!("count {}", count);
                     if count >= 2048 {
                         warp::index_chunks(&db, &device).unwrap();
                     }
-                } else if job == "embed" { 
+                } else if command == "embed" {
                     warp::embed_chunks(&db, &device).unwrap();
                 }
             }
         });
-        Indexer { tx, _handle: handle }
+        Indexer {
+            tx,
+            db_name: db_name.to_string(),
+            _handle: handle,
+        }
     }
     pub fn submit(&self, job: Job) {
         let _ = self.tx.send(job);
@@ -63,7 +72,8 @@ pub struct Warp {
 impl Warp {
     #[napi(constructor)]
     pub fn new() -> Self {
-        let db = warp::DB::new("mydb.sqlite");
+        // we depend on INDEXER.db_name to ensure the DB has been created
+        let db = warp::DB::new_reader(&INDEXER.db_name);
         let device = Device::new_metal(0).unwrap();
         let embedder = warp::Embedder::new(&device);
 
@@ -81,17 +91,16 @@ impl Warp {
     #[napi]
     pub fn add(&self, metadata: String, body: String) {
         println!("add {}", body);
-        warp::add_doc_from_string(&self.db, &metadata, &body).unwrap();
+        INDEXER.submit(("add".to_string(), metadata, body));
     }
 
     #[napi]
-    pub fn embed(&self, metadata: String, body: String) {
-        INDEXER.submit("embed".to_string());
+    pub fn embed(&self) {
+        INDEXER.submit(("embed".to_string(), "".to_string(), "".to_string()));
     }
 
     #[napi]
-    pub fn index(&self, metadata: String, body: String) {
-        INDEXER.submit("index".to_string());
+    pub fn index(&self) {
+        INDEXER.submit(("index".to_string(), "".to_string(), "".to_string()));
     }
 }
-

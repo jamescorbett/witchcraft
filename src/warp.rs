@@ -1,7 +1,7 @@
 use csv;
 use indicatif::ProgressBar;
 use min_heap::MinHeap;
-use rusqlite::{Connection, Result as SQLResult, Row, Statement};
+use rusqlite::{Connection, OpenFlags, Result as SQLResult, Row, Statement};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -735,12 +735,19 @@ struct Query<'connection> {
 }
 
 impl DB {
+    pub fn new_reader(db_fn: &str) -> Self {
+        let connection =
+            Connection::open_with_flags(db_fn, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        Self { connection }
+    }
+
     pub fn new(db_fn: &str) -> Self {
-        //let connection = Connection::open_in_memory().unwrap();
         let connection = Connection::open(db_fn).unwrap();
+
         connection
-            .pragma_update(None, "synchronous", "OFF")
+            .pragma_update(None, "journal_mode", &"WAL")
             .unwrap();
+        connection.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
 
         let query = "CREATE TABLE IF NOT EXISTS document(filename TEXT PRIMARY KEY,
             hash TEXT NOT NULL, body TEXT, UNIQUE(filename, hash))";
