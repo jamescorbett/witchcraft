@@ -24,10 +24,8 @@ candle-core = { version = "*", features = ["metal"] }
 candle-nn = { version = "*", features = ["metal"] }
 candle-transformers = "*"
 tokenizers = "*"
-tracing = "*"
 serde_plain = "1.0.2"
 rand = "0.9.1"
-rusqlite = "0.35.0"
 sha2 = "0.10.9"
 min-heap = "1.0.0"
 indicatif = "0.17.11"
@@ -47,6 +45,6 @@ embed-assets = []
 accelerate = ["dep:libc", "dep:accelerate-src"]
 metal = ["dep:metal", "dep:candle-metal-kernels", "dep:ug-metal"]
 
-#[dependencies.rusqlite]
-#version = "0.35.0"
-#features = ["bundled"]
+[dependencies.rusqlite]
+version = "0.35.0"
+features = ["bundled"]
