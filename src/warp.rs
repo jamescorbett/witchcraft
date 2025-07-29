@@ -25,6 +25,14 @@ use tokenizers::Tokenizer;
 
 const EMBEDDING_DIM: usize = 128;
 
+pub fn make_device() -> Device {
+    if cfg!(target_os = "macos") {
+        Device::new_metal(0).unwrap()
+    } else {
+        Device::Cpu
+    }
+}
+
 fn kmeans(data: &Tensor, k: usize, max_iter: usize, device: &Device) -> Result<(Tensor, Tensor)> {
     let (m, n) = data.dims2()?;
     println!("kmeans k={} m={} n={}...", k, m, n);

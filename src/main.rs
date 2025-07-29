@@ -1,6 +1,5 @@
 use anyhow::Result;
 use std::env;
-use candle_core::Device;
 
 mod warp;
 
@@ -8,7 +7,7 @@ fn main() -> Result<()> {
 
     let args: Vec<String> = env::args().collect();
     let db = warp::DB::new("mydb.sqlite");
-    let device = Device::new_metal(0)?;
+    let device = warp::make_device();
     let embedder = warp::Embedder::new(&device);
 
     if args.len() == 3 && args[1] == "scan" {
