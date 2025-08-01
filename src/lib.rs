@@ -77,7 +77,13 @@ impl Warp {
     }
     #[napi]
     pub fn search(&self, q: String, threshold: f64) -> Vec<(String, String)> {
-        warp::search(&self.db, &self.embedder, &q, threshold as f32, true).unwrap()
+        match warp::search(&self.db, &self.embedder, &q, threshold as f32, true) {
+            Ok(v) => v,
+            Err(e) => {
+                println!("error {} querying for {}", e, &q);
+                [].to_vec()
+            }
+        }
     }
 
     #[napi]
