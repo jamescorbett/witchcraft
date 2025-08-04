@@ -66,7 +66,7 @@ impl Warp {
     pub fn new() -> Self {
         // we depend on INDEXER.db_name to ensure the DB has been created
         let db = warp::DB::new_reader(&INDEXER.db_name);
-        let device = Device::new_metal(0).unwrap();
+        let device = warp::make_device();
         let embedder = warp::Embedder::new(&device);
 
         Self {
