@@ -4,6 +4,7 @@ use csv;
 use indicatif::ProgressBar;
 use rusqlite::{Connection, OpenFlags, Result as SQLResult, Row, Statement};
 use serde::Deserialize;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
@@ -670,13 +671,13 @@ pub fn read_csv(db: &DB, csvname: &str) -> Result<()> {
 
     for result in rdr.deserialize() {
         let record: Record = result?;
-        let filename = record.name;
+        let metadata = json!({ "key": record.name }).to_string();
         let body = record.body;
 
         let mut hasher = Sha256::new();
         hasher.update(&body);
         let hash = format!("{:x}", hasher.finalize());
-        db.add_doc(&filename, &hash, &body).unwrap();
+        db.add_doc(&metadata, &hash, &body).unwrap();
     }
 
     Ok(())
@@ -687,7 +688,8 @@ pub fn add_doc_from_file(db: &DB, filename: &str) -> Result<()> {
     let mut hasher = Sha256::new();
     hasher.update(&body);
     let hash = format!("{:x}", hasher.finalize());
-    db.add_doc(&filename, &hash, &body).unwrap();
+    let metadata = json!({ "filename": filename }).to_string();
+    db.add_doc(&metadata, &hash, &body).unwrap();
     Ok(())
 }
 
@@ -792,8 +794,8 @@ impl DB {
             //.unwrap();
         connection.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
 
-        let query = "CREATE TABLE IF NOT EXISTS document(filename TEXT PRIMARY KEY,
-            hash TEXT NOT NULL, body TEXT, UNIQUE(filename, hash))";
+        let query = "CREATE TABLE IF NOT EXISTS document(metadata JSON,
+            hash TEXT NOT NULL, body TEXT, UNIQUE(metadata, hash))";
         connection.execute(query, ()).unwrap();
 
         let query = "CREATE INDEX IF NOT EXISTS document_index ON document(hash)";
@@ -849,10 +851,10 @@ impl DB {
         Ok(())
     }
 
-    fn add_doc(self: &Self, filename: &str, hash: &str, body: &str) -> SQLResult<()> {
+    fn add_doc(self: &Self, metadata: &str, hash: &str, body: &str) -> SQLResult<()> {
         self.connection.execute(
             "INSERT OR IGNORE INTO document VALUES(?1, ?2, ?3)",
-            (&filename, &hash, &body),
+            (&metadata, &hash, &body),
         )?;
         Ok(())
     }
@@ -950,7 +952,7 @@ pub fn embed_chunks(db: &DB, device: &Device) -> Result<()> {
         FROM document
         LEFT JOIN chunk ON document.hash = chunk.hash
         WHERE chunk.hash IS NULL
-        ORDER BY filename",
+        ORDER BY document.hash",
         )
         .unwrap();
 
@@ -1061,12 +1063,12 @@ pub fn search(
     };
 
     let mut results = vec![];
-    let mut body_query = db.query("SELECT filename,body FROM document WHERE rowid = ?1")?;
+    let mut body_query = db.query("SELECT metadata,body FROM document WHERE rowid = ?1")?;
     for idx in fused {
-        let (filename, body) = body_query.point((idx,), |row| {
+        let (metadata, body) = body_query.point((idx,), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
-        results.push((filename, body));
+        results.push((metadata, body));
     }
     Ok(results)
 }
@@ -1088,7 +1090,7 @@ pub fn bulk_search(
     let file = File::create(outputname).unwrap();
     let mut writer = BufWriter::new(file);
 
-    let mut filename_query = db.query("SELECT filename FROM document WHERE rowid = ?1")?;
+    let mut filename_query = db.query("SELECT metadata FROM document WHERE rowid = ?1")?;
 
     for result in rdr.deserialize() {
         let record: (String, String) = result?;
