@@ -9,6 +9,7 @@ fn main() -> Result<()> {
     let db = warp::DB::new("mydb.sqlite");
     let device = warp::make_device();
     let embedder = warp::Embedder::new(&device);
+    let mut cache = warp::EmbeddingsCache::new(1);
 
     if args.len() == 3 && args[1] == "scan" {
 
@@ -34,7 +35,7 @@ fn main() -> Result<()> {
 
         let q = &args[2..].join(" ");
         let use_fulltext = args[1] == "hybrid";
-        let results = warp::search(&db, &embedder, &q, 0.75, 10, use_fulltext, None).unwrap();
+        let results = warp::search(&db, &embedder, &mut cache, &q, 0.75, 10, use_fulltext, None).unwrap();
         for (filename, body) in results {
             println!("{} : {}", filename, body);
         }
@@ -46,6 +47,14 @@ fn main() -> Result<()> {
         let csvname = &args[2];
         let outputname = &args[3];
         warp::bulk_search(&db, &embedder, &csvname, &outputname, use_fulltext, use_semantic).unwrap();
+
+    } else if args.len() >= 4 && &args[1] == "score" {
+
+        let sentences: Vec<String> = std::env::args().skip(3).collect();
+        let scores = warp::score_query_sentences(&embedder, &mut cache, &args[2], &sentences).unwrap();
+        for (i, score) in scores.iter().enumerate() {
+            println!("`{}': score={}", args[3 + i], *score);
+        }
 
     } else {
        eprintln!("\n*** Usage: {} scan | readcsv <file> | embed | index | query <text> | hybrid <text> | querycsv <file> <results-file> ***\n", args[0]);

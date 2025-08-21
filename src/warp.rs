@@ -1035,24 +1035,62 @@ pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
     Ok(())
 }
 
+use lru::LruCache;
+use std::num::NonZeroUsize;
+
+pub struct EmbeddingsCache {
+    cache: LruCache<String, Tensor>,
+}
+
+impl EmbeddingsCache {
+    pub fn new(capacity: usize) -> Self {
+        let cap = NonZeroUsize::new(capacity.max(1)).unwrap();
+        Self { cache: LruCache::new(cap) }
+    }
+
+    pub fn get(&mut self, key: &String) -> Option<Tensor> {
+        self.cache.get(key).cloned()
+    }
+
+    pub fn put(&mut self, key: &String, value: &Tensor) {
+        self.cache.put(key.into(), value.clone());
+    }
+}
+
 pub fn search(
     db: &DB,
     embedder: &Embedder,
+    cache: &mut EmbeddingsCache,
     q: &String,
     threshold: f32,
     top_k: usize,
     use_fulltext: bool,
     sql_filter: Option<&str>,
 ) -> Result<Vec<(String, String)>> {
+
+    let q = q.split_whitespace().collect::<Vec<_>>().join(" ");
+
     let fts_idxs = if use_fulltext {
-        println!("Doing full text search for: {}", q);
+        println!("Doing full text search for: `{}'", q);
         fulltext_search(&db, &q, sql_filter)?
     } else {
         [].to_vec()
     };
 
-    println!("Doing semantic search for: {}", q);
-    let qe = embedder.embed(q)?.get(0)?;
+    println!("Doing semantic search for: `{}'", q);
+
+    let qe = match cache.get(&q) {
+        Some(existing) => {
+            println!("found cached query");
+            existing
+        }
+        None => {
+            let qe = embedder.embed(&q)?.get(0)?;
+            cache.put(&q, &qe);
+            qe
+        }
+    };
+
     let sem_matches = match_centroids(&db, &qe, threshold, top_k, sql_filter).unwrap();
     let sem_idxs: Vec<u32> = sem_matches.iter().map(|&(_, idx)| idx).collect();
     println!("semantic search found {} matches", sem_idxs.len());
@@ -1072,6 +1110,50 @@ pub fn search(
         results.push((metadata, body));
     }
     Ok(results)
+}
+
+pub fn score_query_sentences(
+    embedder: &Embedder,
+    cache: &mut EmbeddingsCache,
+    q: &String,
+    sentences: &[String],
+) -> Result<Vec<f32>> {
+
+    let qe = match cache.get(&q) {
+        Some(existing) => {
+            existing
+        }
+        None => {
+            let qe = embedder.embed(&q)?.get(0)?;
+            cache.put(&q, &qe);
+            qe
+        }
+    };
+    let (m, _n) = qe.dims2()?;
+    let mut sizes = vec![];
+    let mut ses = vec![];
+    for s in sentences.iter() {
+        let se = embedder.embed(&s)?.get(0)?;
+        let split = split_tensor(&se);
+        sizes.push(split.len());
+        ses.extend(split);
+    }
+    let ses = Tensor::cat(&ses, 0)?;
+    let sim = ses.matmul(&qe.transpose(D::Minus1, D::Minus2)?)?;
+    let sim = sim.to_device(&Device::Cpu)?;
+
+    let mut scores = vec![];
+    let mut i = 0;
+    for sz in sizes.iter() {
+        let mut max = Tensor::zeros((m,), DType::F32, &Device::Cpu)?;
+        for _ in 0usize..*sz {
+            let row = sim.get(i)?;
+            max = max.maximum(&row)?;
+            i += 1;
+        }
+        scores.push(max.mean(0)?.to_scalar::<f32>()?);
+    }
+    Ok(scores)
 }
 
 pub fn bulk_search(

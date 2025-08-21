@@ -58,6 +58,7 @@ mod warp;
 pub struct Warp {
     db: warp::DB,
     embedder: warp::Embedder,
+    cache: warp::EmbeddingsCache,
 }
 
 #[napi]
@@ -68,27 +69,34 @@ impl Warp {
         let db = warp::DB::new_reader(&indexer.db_name);
         let device = warp::make_device();
         let embedder = warp::Embedder::new(&device);
+        let cache = warp::EmbeddingsCache::new(16);
 
         Self {
             db: db,
             embedder: embedder,
+            cache: cache,
         }
     }
     #[napi]
-    pub fn search(&self, q: String, threshold: f64, top_k: u32, sql_filter: String) -> Vec<(String, String)> {
+    pub fn search(&mut self, q: String, threshold: f64, top_k: u32, sql_filter: String) -> Vec<(String, String)> {
 
         let filter = if !sql_filter.is_empty() {
             Some(sql_filter.as_str())
         } else {
             None
         };
-        match warp::search(&self.db, &self.embedder, &q, threshold as f32, top_k as usize, true, filter) {
+        match warp::search(&self.db, &self.embedder, &mut self.cache, &q, threshold as f32, top_k as usize, true, filter) {
             Ok(v) => v,
             Err(e) => {
                 println!("error {} querying for {}", e, &q);
                 [].to_vec()
             }
         }
+    }
+
+    #[napi]
+    pub fn score(&mut self, q: String, sentences: Vec<String>) -> Vec<f32> {
+        warp::score_query_sentences(&self.embedder, &mut self.cache, &q, &sentences).unwrap()
     }
 
     #[napi]
