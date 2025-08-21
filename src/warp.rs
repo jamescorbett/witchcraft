@@ -836,7 +836,7 @@ impl DB {
         Ok(())
     }
 
-    fn query(self: &Self, sql: &str) -> SQLResult<Query> {
+    fn query(self: &Self, sql: &str) -> SQLResult<Query<'_>> {
         let stmt = self.connection.prepare(&sql)?;
         Ok(Query { stmt })
     }
