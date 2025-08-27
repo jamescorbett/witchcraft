@@ -1,9 +1,11 @@
+env/bin/activate:
+	python3 -m venv env
 
-xtr-base-en/model.safetensors:
-	python downloadxtr.py
+env/bin/transformers-cli: env/bin/activate
+	(source env/bin/activate; pip install -r requirements.txt)
 
-assets/config.json.zst assets/tokenizer.json.zst xtr.safetensors assets/xtr.safetensors.zst: xtr-base-en/model.safetensors
-	python downloadweights.py
+assets/config.json.zst assets/tokenizer.json.zst xtr.safetensors assets/xtr.safetensors.zst: env/bin/transformers-cli
+	(source env/bin/activate; python downloadweights.py)
 
 xtr.gguf: xtr.safetensors
 	cargo run --release --bin quantize-tool xtr.safetensors xtr.gguf
@@ -29,4 +31,4 @@ run: build
 
 mcp: buildemb
 	yarn build
-	cmcp "yarn start" tools/call name=search 'arguments:={"q": "Drew Houston hack week project" }'
+	cmcp "yarn start" tools/call name=search 'arguments:={"q": "teenagers and acne" }'

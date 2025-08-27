@@ -1,10 +1,13 @@
 import torch
 import torch.nn as nn
 from transformers import AutoTokenizer, AutoModel, logging
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, snapshot_download
 from safetensors.torch import save_file
 import zstandard as zstd
 import os
+
+
+snapshot_download(repo_id="google/xtr-base-en", local_dir="xtr-base-en", local_dir_use_symlinks=False, revision="main")
 
 class ProgressReader:
     def __init__(self, fileobj, label="", report_every_mb=1):
@@ -18,7 +21,7 @@ class ProgressReader:
         chunk = self.fileobj.read(size)
         self.total_read += len(chunk)
         if self.total_read >= self.next_report:
-            print(f"[{self.label}] Read {self.total_read / (1024*1024):.1f} MB...")
+            print(f"[{self.label}] Compressed {self.total_read / (1024*1024):.1f} MB...")
             self.next_report += self.report_every
         return chunk
 
@@ -39,28 +42,21 @@ class XTRLinear(torch.nn.Module):
     def forward(self, x):
         return self.linear(x)
 
-class T5(nn.Module):
+class XTR(nn.Module):
     def __init__(self):
         super().__init__()
+
         self.encoder = AutoModel.from_pretrained("google/xtr-base-en", torch_dtype=torch.float16, use_safetensors=True).encoder
-        to_dense_path = hf_hub_download(repo_id="google/xtr-base-en", filename="2_Dense/pytorch_model.bin")
-
-class XTR(T5):
-    def __init__(self):
-        super().__init__()
-
         self.encoder.linear = torch.nn.Linear(768, 128, bias=False)
+
+        to_dense_path = hf_hub_download(repo_id="google/xtr-base-en", filename="2_Dense/pytorch_model.bin")
         state = torch.load(to_dense_path)
+
         other = {}
         other["weight"] = state["linear.weight"]
         self.encoder.linear.load_state_dict(other)
 
-t5 = T5()
-fp16_state_dict = {k: v.half().cpu() for k, v in t5.state_dict().items()}
-save_file(fp16_state_dict, "t5.safetensors")
-
-import sys
-sys.exit(0)
+snapshot_download(repo_id="google/xtr-base-en", local_dir="xtr-base-en", local_dir_use_symlinks=False, revision="main")
 
 xtr = XTR()
 fp16_state_dict = {k: v.half().cpu() for k, v in xtr.state_dict().items()}
@@ -68,4 +64,4 @@ save_file(fp16_state_dict, "xtr.safetensors")
 
 compress_file("xtr-base-en/config.json", "assets/config.json.zst")
 compress_file("xtr-base-en/tokenizer.json", "assets/tokenizer.json.zst")
-compress_file("xtr.safetensors", "assets/xtr.safetensors.zst")
+#compress_file("xtr.safetensors", "assets/xtr.safetensors.zst")

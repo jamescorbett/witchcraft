@@ -16,15 +16,20 @@ source env/bin/activate
 pip -r requirements.txt
 ```
 
-* downloadxtr.py downloads the full repo, we only need the tokenizers
-
-* downloadweights.py downloads the weights (again), adds the extra
+* downloadweights.py downloads the XTR weights, adds the extra
   XTRLinear layer, and exports into xtr.safetensors. It also compressed
   the weights with zstd, unfortunately takes some time, but you only have
   to do it once.
 
 (If you encounter TLS cerficiate errors running these scripts locally there is a
 problem with your ZScaler cert setup.)
+
+## Cheat: Do everything with make: ##
+```
+make build
+```
+
+Should also get you going.
 
 ## Creating an index: ##
 
