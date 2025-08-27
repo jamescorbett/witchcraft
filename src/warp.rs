@@ -373,7 +373,7 @@ fn get_centers(db: &DB, device: &Device, version: u64) -> Result<(Vec<u32>, Vec<
 fn match_centroids(
     db: &DB,
     query_embeddings: &Tensor,
-    cutoff: f32,
+    threshold: f32,
     top_k: usize,
     sql_filter: Option<&str>,
 ) -> Result<Vec<(f32, u32)>> {
@@ -496,6 +496,14 @@ fn match_centroids(
 
     let missing_similarities = Tensor::from_vec(missing, m, &Device::Cpu)?;
 
+    let missing_score = missing_similarities.mean(0)?.to_scalar::<f32>()?;
+    let cutoff = if missing_score > threshold {
+        missing_score
+    } else {
+        threshold
+    };
+
+
     let now = std::time::Instant::now();
     let mut num_unindexed = 0;
     let mut unindexed_chunks_query = db.query(
@@ -548,27 +556,26 @@ fn match_centroids(
     let sim = sim.to_device(&Device::Cpu)?;
 
     println!("sim mmul took {} ms.", now.elapsed().as_millis());
+
     let now = std::time::Instant::now();
-
     all.sort();
+    println!("sorting {} rows took {}ms", all.len(), now.elapsed().as_millis());
 
+    let now = std::time::Instant::now();
     let mut current = Tensor::zeros((n,), DType::F32, &Device::Cpu)?;
 
     let mut unique_docs = 0;
-
     let mut prev_idx = 0;
-
-    db.execute("CREATE TEMPORARY TABLE temp2(rowid INTEGER PRIMARY KEY, score FLOAT)").unwrap();
-    let mut insert_temp_query = db.query("INSERT INTO temp2 VALUES(?1, ?2)");
+    let mut all_scored = vec![];
 
     for i in 0.. {
         let is_last = i == all.len() - 1;
         let (idx, pos) = all[i];
         if i > 0 && (prev_idx != idx || is_last) {
             unique_docs += 1;
-            let score = current.mean(0)?.to_scalar::<f32>()?;
-            if score >= cutoff {
-                insert_temp_query.execute((prev_idx, score)).unwrap();
+            let score = current.mean(0)?.to_scalar::<f32>().unwrap();
+            if score > cutoff {
+                all_scored.push((prev_idx, score));
             }
         }
 
@@ -586,10 +593,19 @@ fn match_centroids(
         prev_idx = idx;
     }
     println!(
-        "scoring {} documents took {} ms.",
+        "scoring {} documents into {} candidates took {} ms.",
         unique_docs,
+        all_scored.len(),
         now.elapsed().as_millis()
     );
+
+    let now = std::time::Instant::now();
+    db.execute("CREATE TEMPORARY TABLE temp2(rowid INTEGER PRIMARY KEY, score FLOAT)").unwrap();
+    let mut insert_temp_query = db.query("INSERT INTO temp2 VALUES(?1, ?2)");
+
+    for (idx, score) in all_scored.iter() {
+        insert_temp_query.execute((idx, score)).unwrap();
+    }
 
     let sql = format!(
         "SELECT score,document.rowid
@@ -612,6 +628,10 @@ fn match_centroids(
         .collect::<Result<Vec<_>, _>>()?;
 
     db.execute("DROP TABLE temp2").unwrap();
+    println!(
+        "reading scored and filtered document ids from DB took {} ms",
+        now.elapsed().as_millis()
+    );
     Ok(results)
 }
 
