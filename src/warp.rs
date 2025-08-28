@@ -15,6 +15,7 @@ use once_cell::sync::Lazy;
 use std::sync::RwLock;
 mod quantized_t5;
 pub mod assets;
+mod histogram;
 
 mod packops;
 use packops::TensorPackOps;
@@ -1239,6 +1240,7 @@ pub fn bulk_search(
     let mut writer = BufWriter::new(file);
 
     let mut metadata_query = db.query("SELECT metadata FROM document WHERE rowid = ?1");
+    let mut histogram = histogram::Histogram::new(10000);
 
     for result in rdr.deserialize() {
         let record: (String, String) = result?;
@@ -1246,6 +1248,7 @@ pub fn bulk_search(
         let question = record.1;
 
         println!("\nSearching for: {}", question);
+        let now = std::time::Instant::now();
         let fts_idxs = if use_fulltext {
             fulltext_search(&db, &question, None)?
         } else {
@@ -1279,6 +1282,9 @@ pub fn bulk_search(
             let metadata = metadata_query.query_row((idx,), |row| Ok(row.get::<_, String>(0)?))?;
             metadatas.push(metadata);
         }
+        let total_ms = now.elapsed().as_millis();
+        histogram.record(total_ms.try_into().unwrap());
+        println!("search took {} ms in total", now.elapsed().as_millis());
 
         write!(writer, "{}\t", key).unwrap();
         for metadata in &metadatas {
@@ -1288,5 +1294,7 @@ pub fn bulk_search(
         write!(writer, "\n").unwrap();
         writer.flush().unwrap();
     }
+    let p95 = histogram.p95();
+    println!("p95 search latency = {} ms", p95);
     Ok(())
 }
