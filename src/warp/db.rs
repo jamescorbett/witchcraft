@@ -1,7 +1,7 @@
 use rusqlite::{Connection, OpenFlags, Result as SQLResult, Statement};
 use sha2::{Digest, Sha256};
 
-const HASH_CHARS: usize = 16; // we'll use sha256 truncated at 64 bits/16 characters
+const HASH_CHARS: usize = 32; // we'll use sha256 truncated at 128 bits/32 characters
 
 pub struct DB {
     connection: Connection,
