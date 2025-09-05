@@ -16,7 +16,7 @@ assets/xtr.gguf.zst: xtr.safetensors
 download: assets/config.json.zst assets/tokenizer.json.zst assets/xtr.safetensors.zst assets/xtr.gguf.zst
 
 build: download
-	cargo build --release --target aarch64-apple-darwin --features accelerate
+	RUSTFLAGS='-C target-feature=+neon' cargo build --release --target aarch64-apple-darwin --features accelerate
 	ln -vf target/aarch64-apple-darwin/release/libwarp.dylib target/release/warp.node
 
 buildemb: download
@@ -34,7 +34,7 @@ winmodule:
 	ln -vf target/x86_64-pc-windows-msvc/release/warp.dll target/release/warp-windows.node
 
 win: download
-	cargo xwin build --release --target x86_64-pc-windows-msvc --features embed-assets
+	RUSTFLAGS='-C target-feature=+avx2' cargo xwin build --release --target x86_64-pc-windows-msvc --features embed-assets
 
 run: build
 	node index.js
