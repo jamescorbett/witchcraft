@@ -288,29 +288,55 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
     Ok(())
 }
 
-pub fn fulltext_search(db: &DB, q: &String, sql_filter: Option<&str>) -> Result<Vec<u32>> {
+pub fn fulltext_search(
+    db: &DB,
+    q: &String,
+    top_k: usize,
+    sql_filter: Option<&str>,
+) -> Result<Vec<u32>> {
     let mut fts_idxs = vec![];
 
-    let sql = format!(
-        "SELECT document.rowid,bm25(document_fts) AS score
-        FROM document,document_fts
-        WHERE document.rowid == document_fts.rowid
-        AND document_fts MATCH ?1
-        {}
-        ORDER BY score",
-        match sql_filter {
-            Some(filter) => format!("AND {filter}"),
-            _ => String::new(),
-        }
-    );
-    let mut query = db.query(&sql);
-
+    let mut last_is_space = false;
+    for c in q.chars() {
+        last_is_space = c == ' ';
+    }
     let q: String = q
         .chars()
         .filter(|c| c.is_alphanumeric() || c.is_whitespace())
         .collect();
 
-    let results = query.query_map((&q,), |row| Ok((row.get::<_, u32>(0)?,)))?;
+    let filter = match sql_filter {
+        Some(filter) => format!("AND {filter}"),
+        _ => String::new(),
+    };
+
+    let sql = if q.len() > 0 {
+        format!(
+            "SELECT document.rowid,bm25(document_fts) AS score
+            FROM document,document_fts
+            WHERE document.rowid = document_fts.rowid
+            AND document_fts MATCH ?1 {filter}
+            ORDER BY score,date DESC
+            LIMIT ?2",
+        )
+    } else {
+        format!(
+            "SELECT rowid,0.0
+            FROM document
+            WHERE ?1 = ?1 {filter}
+            ORDER BY date DESC
+            LIMIT ?2",
+        )
+    };
+
+    let q = if last_is_space {
+        q
+    } else {
+        format!("{q}*").to_string()
+    };
+
+    let mut query = db.query(&sql);
+    let results = query.query_map((&q, top_k), |row| Ok((row.get::<_, u32>(0)?,)))?;
     for result in results {
         let (rowid,) = result?;
         fts_idxs.push(rowid);
@@ -931,22 +957,26 @@ pub fn search(
     let q = q.split_whitespace().collect::<Vec<_>>().join(" ");
 
     let fts_idxs = if use_fulltext {
-        fulltext_search(&db, &q, sql_filter)?
+        fulltext_search(&db, &q, top_k, sql_filter)?
     } else {
         [].to_vec()
     };
 
-    let qe = match cache.get(&q) {
-        Some(existing) => existing,
-        None => {
-            let qe = embedder.embed(&q)?.get(0)?;
-            cache.put(&q, &qe);
-            qe
-        }
+    let sem_matches = if q.len() > 0 {
+        let qe = match cache.get(&q) {
+            Some(existing) => existing,
+            None => {
+                let qe = embedder.embed(&q)?.get(0)?;
+                cache.put(&q, &qe);
+                qe
+            }
+        };
+        match_centroids(&db, &qe, threshold, top_k, sql_filter).unwrap()
+    } else {
+        [].to_vec()
     };
 
     let mut scores: HashMap<u32, f32> = HashMap::new();
-    let sem_matches = match_centroids(&db, &qe, threshold, top_k, sql_filter).unwrap();
     for (score, idx) in &sem_matches {
         scores.insert(*idx, *score);
     }

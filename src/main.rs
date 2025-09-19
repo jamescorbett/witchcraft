@@ -72,7 +72,7 @@ pub fn bulk_search(
         println!("\nSearching for: {}", question);
         let now = std::time::Instant::now();
         let fts_idxs = if use_fulltext {
-            warp::fulltext_search(&db, &question, None)?
+            warp::fulltext_search(&db, &question, 100, None)?
         } else {
             [].to_vec()
         };
