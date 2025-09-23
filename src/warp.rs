@@ -984,11 +984,12 @@ pub fn search(
     let sem_idxs: Vec<u32> = sem_matches.iter().map(|&(_, idx)| idx).collect();
     println!("semantic search found {} matches", sem_idxs.len());
 
-    let fused = if use_fulltext {
+    let mut fused = if use_fulltext {
         reciprocal_rank_fusion(&fts_idxs, &sem_idxs, 60.0)
     } else {
         sem_idxs
     };
+    fused.truncate(top_k);
 
     let mut results = vec![];
     let mut body_query = db.query("SELECT metadata,body FROM document WHERE rowid = ?1");
