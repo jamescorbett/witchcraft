@@ -136,22 +136,17 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
     assert!(embeddings_count > 0);
     let bar = progress::new(embeddings_count as u64);
 
-    //let mut document_indices = vec![];
-    let mut document_indices = Vec::<u32>::new();
+    let mut chunk_indices = vec![];
     let mut all_chunkids = vec![];
     let mut all_embeddings = vec![];
 
     let mut query = db.query(
-        "SELECT document.rowid,chunk.rowid,chunk.embeddings FROM document,chunk
+        "SELECT chunk.rowid,chunk.embeddings FROM document,chunk
         WHERE document.hash = chunk.hash",
     )?;
 
     let mut results = query.query_map((), |row| {
-        Ok((
-            row.get::<_, u32>(0)?,
-            row.get::<_, u32>(1)?,
-            row.get::<_, Vec<u8>>(2)?,
-        ))
+        Ok((row.get::<_, u32>(0)?, row.get::<_, Vec<u8>>(1)?))
     })?;
 
     let mut done = false;
@@ -161,14 +156,14 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
     while !done {
         match results.next() {
             Some(result) => {
-                let (id, chunkid, embeddings) = result?;
+                let (chunkid, embeddings) = result?;
                 let t = Tensor::from_q8_bytes(&embeddings, EMBEDDING_DIM, &Device::Cpu)?
                     .dequantize(8)?
                     .l2_normalize()?;
                 let split = split_tensor(&t);
                 let m = split.len();
                 for _ in 0..m {
-                    document_indices.push(id as u32);
+                    chunk_indices.push(chunkid as u32);
                 }
                 all_chunkids.push(chunkid);
                 all_embeddings.extend(split);
@@ -188,7 +183,7 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
             let left = batch - take;
 
             let embeddings = all_embeddings.split_off(left);
-            let indices = document_indices.split_off(left);
+            let indices = chunk_indices.split_off(left);
             let data = Tensor::cat(&embeddings, 0)?.to_device(&device)?;
 
             let sim = data.matmul(&centers.transpose(D::Minus1, D::Minus2)?)?;
@@ -489,14 +484,13 @@ pub fn match_centroids(
     let device = query_embeddings.device();
     let (m, _n) = query_embeddings.dims2()?;
 
-    let mut all_document_embeddings = vec![];
+    let mut all_chunk_embeddings = vec![];
     let mut all = vec![];
     let mut count = 0;
     let mut missing = vec![];
 
     let (cluster_ids, sizes, centers, centers_matrix) =
         get_centers(&db, &device, max_generation as u64)?;
-
 
     if centers.len() > 0 {
         let now = std::time::Instant::now();
@@ -543,25 +537,27 @@ pub fn match_centroids(
         let now = std::time::Instant::now();
 
         for i in topk_clusters {
-
-            let (document_indices, document_embeddings) = bucket_query
+            let (chunk_indices, document_embeddings) = bucket_query
                 .query_row((max_generation, cluster_ids[i as usize]), |row| {
                     Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
                 })?;
 
             match centers.get(i as usize) {
                 Some(center) => {
-                    let document_indices = u8_to_vec_u32(&document_indices);
+                    let chunk_indices = u8_to_vec_u32(&chunk_indices);
 
                     //let residuals = Tensor::from_q4_bytes(&document_embeddings, EMBEDDING_DIM, &device)?.dequantize(4)?.inv_compand()?;
-                    let residuals =
-                        Tensor::from_companded_q4_bytes(&document_embeddings, EMBEDDING_DIM, &Device::Cpu)?;
+                    let residuals = Tensor::from_companded_q4_bytes(
+                        &document_embeddings,
+                        EMBEDDING_DIM,
+                        &Device::Cpu,
+                    )?;
                     let embeddings = residuals.broadcast_add(&center)?;
-                    all_document_embeddings.push(embeddings);
+                    all_chunk_embeddings.push(embeddings);
 
                     let (m, _) = residuals.dims2()?;
                     for j in 0..m {
-                        all.push((document_indices[j], count));
+                        all.push((chunk_indices[j], count));
                         count += 1;
                     }
                 }
@@ -594,9 +590,8 @@ pub fn match_centroids(
     let mut num_unindexed = 0;
     let mut unindexed_chunks_query = db.query(
         "
-        SELECT d.rowid, c.embeddings
-        FROM document AS d
-        JOIN chunk AS c ON c.hash = d.hash
+        SELECT rowid,embeddings
+        FROM chunk as c
         WHERE NOT EXISTS (
           SELECT 1
           FROM indexed_chunk AS i
@@ -606,7 +601,10 @@ pub fn match_centroids(
     )?;
 
     let results = unindexed_chunks_query.query_map((max_generation,), |row| {
-        Ok((row.get::<_, u32>(0)?, row.get::<_, Vec<u8>>(1)?))
+        Ok((
+            row.get::<_, u32>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+        ))
     })?;
     for result in results {
         let (id, embeddings) = result?;
@@ -614,7 +612,7 @@ pub fn match_centroids(
             .dequantize(8)?
             .l2_normalize()?;
         let (m, _) = embeddings.dims2()?;
-        all_document_embeddings.push(embeddings);
+        all_chunk_embeddings.push(embeddings);
         for _ in 0..m {
             all.push((id, count));
             count += 1;
@@ -627,16 +625,16 @@ pub fn match_centroids(
         now.elapsed().as_millis()
     );
 
-    if all_document_embeddings.len() == 0 {
+    if all_chunk_embeddings.len() == 0 {
         return Ok([].to_vec());
     }
 
-    let all_document_embeddings = Tensor::cat(&all_document_embeddings, 0)?;
-    let all_document_embeddings = all_document_embeddings.to_device(query_embeddings.device())?;
+    let all_chunk_embeddings = Tensor::cat(&all_chunk_embeddings, 0)?;
+    let all_chunk_embeddings = all_chunk_embeddings.to_device(query_embeddings.device())?;
 
     let now = std::time::Instant::now();
     let sim = query_embeddings
-        .matmul(&all_document_embeddings.t()?)?
+        .matmul(&all_chunk_embeddings.t()?)?
         .transpose(0, 1)?;
     let sim = sim.to_device(&Device::Cpu)?;
 
@@ -708,8 +706,9 @@ pub fn match_centroids(
 
     let sql = format!(
         "SELECT score,document.rowid
-        FROM document,temp2
-        WHERE document.rowid = temp2.rowid
+        FROM document,temp2,chunk
+        WHERE chunk.rowid = temp2.rowid
+        AND document.hash = chunk.hash
         {}
         ORDER BY score DESC
         LIMIT ?1",
@@ -877,7 +876,10 @@ pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
         info!("all chunks indexed already!");
         return Ok(());
     }
-    info!("database has {} unindexed embeddings, reindexing...", unindexed);
+    info!(
+        "database has {} unindexed embeddings, reindexing...",
+        unindexed
+    );
 
     let mut kmeans_query = db.query("SELECT chunk.embeddings FROM chunk")?;
     let mut total_embeddings = 0;
