@@ -497,7 +497,6 @@ pub fn match_centroids(
     let (cluster_ids, sizes, centers, centers_matrix) =
         get_centers(&db, &device, max_generation as u64)?;
 
-
     if centers.len() > 0 {
         let now = std::time::Instant::now();
 
@@ -543,7 +542,6 @@ pub fn match_centroids(
         let now = std::time::Instant::now();
 
         for i in topk_clusters {
-
             let (document_indices, document_embeddings) = bucket_query
                 .query_row((max_generation, cluster_ids[i as usize]), |row| {
                     Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
@@ -554,8 +552,11 @@ pub fn match_centroids(
                     let document_indices = u8_to_vec_u32(&document_indices);
 
                     //let residuals = Tensor::from_q4_bytes(&document_embeddings, EMBEDDING_DIM, &device)?.dequantize(4)?.inv_compand()?;
-                    let residuals =
-                        Tensor::from_companded_q4_bytes(&document_embeddings, EMBEDDING_DIM, &Device::Cpu)?;
+                    let residuals = Tensor::from_companded_q4_bytes(
+                        &document_embeddings,
+                        EMBEDDING_DIM,
+                        &Device::Cpu,
+                    )?;
                     let embeddings = residuals.broadcast_add(&center)?;
                     all_document_embeddings.push(embeddings);
 
@@ -773,29 +774,23 @@ impl<'a> Iterator for Gatherer<'a> {
     type Item = (String, Tensor);
 
     fn next(&mut self) -> Option<Self::Item> {
-        let mut doc_embedding = vec![];
         match self.documents.next() {
             Some((hash, body)) => {
                 let now = std::time::Instant::now();
-                let embeddings = self
-                    .embedder
-                    .embed(&body)
+                let embeddings = self.embedder.embed(&body).unwrap();
+                let embeddings = embeddings
+                    .squeeze(0)
                     .unwrap()
                     .to_device(&Device::Cpu)
                     .unwrap();
-                let embeddings = embeddings.to_device(&Device::Cpu).unwrap();
-
-                let (_b, m, _n) = embeddings.dims3().unwrap();
+                let (m, _n) = embeddings.dims2().unwrap();
                 let dt = now.elapsed().as_secs_f64();
                 debug!(
                     "embedder took {} ms ({} rows/s).",
                     now.elapsed().as_millis(),
                     ((m as f64) / dt).round()
                 );
-
-                let split = split_tensor(&embeddings.get(0).ok()?);
-                doc_embedding.extend(split);
-                Some((hash, Tensor::cat(&doc_embedding, 0).unwrap()))
+                Some((hash, embeddings))
             }
             None => None,
         }
@@ -877,7 +872,10 @@ pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
         info!("all chunks indexed already!");
         return Ok(());
     }
-    info!("database has {} unindexed embeddings, reindexing...", unindexed);
+    info!(
+        "database has {} unindexed embeddings, reindexing...",
+        unindexed
+    );
 
     let mut kmeans_query = db.query("SELECT chunk.embeddings FROM chunk")?;
     let mut total_embeddings = 0;

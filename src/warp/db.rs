@@ -123,7 +123,6 @@ impl DB {
         Ok(())
     }
 
-
     pub fn refresh_ft(&mut self) -> SQLResult<()> {
         self.execute("INSERT INTO document_fts(document_fts) VALUES('rebuild')")?;
         Ok(())
