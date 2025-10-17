@@ -347,9 +347,9 @@ pub fn fulltext_search(
     };
 
     let q = if last_is_space {
-        q
+        q.trim()
     } else {
-        format!("{q}*").to_string()
+        &format!("{q}*").to_string()
     };
 
     let mut query = db.query(&sql)?;
