@@ -764,15 +764,12 @@ pub fn match_centroids(
     );
 
     let now = std::time::Instant::now();
-    let mut scores = vec![0.0f32; n];
     let mut sub_scores = vec![0.0f32; n];
-    scores.copy_from_slice(&missing_similarities);
     sub_scores.copy_from_slice(&missing_similarities);
 
-    let mut unique_docs = 0;
-    let mut prev_idx = u32::MAX;
     let mut all_scored = vec![];
 
+    let mut prev_idx = u32::MAX;
     let mut prev_sub_idx = u32::MAX;
     let mut max_sub_score = -1.0f32;
     let mut i_max_sub_score = 0;
@@ -788,7 +785,6 @@ pub fn match_centroids(
         let sub_idx_change = idx_change || prev_sub_idx != sub_idx;
 
         if i > 0 {
-
             if sub_idx_change || is_last {
                 let sub_score = scaler * (sub_scores.iter().copied().sum::<f32>());
                 if sub_score > max_sub_score {
@@ -799,14 +795,11 @@ pub fn match_centroids(
             }
 
             if idx_change || is_last {
-                unique_docs += 1;
-                let score = scaler * (scores.iter().copied().sum::<f32>());
-                if score > cutoff {
-                    all_scored.push((prev_idx, score, i_max_sub_score));
+                if max_sub_score > cutoff {
+                    all_scored.push((prev_idx, max_sub_score, i_max_sub_score));
                 }
                 max_sub_score = -1.0f32;
                 i_max_sub_score = 0;
-                scores.copy_from_slice(&missing_similarities);
             }
 
         }
@@ -816,7 +809,6 @@ pub fn match_centroids(
         }
 
         let row = row_at(pos);
-        vmax_inplace(&mut scores, row);
         vmax_inplace(&mut sub_scores, row);
 
         assert!(i == 0 || prev_idx <= idx);
@@ -825,8 +817,7 @@ pub fn match_centroids(
         prev_sub_idx = sub_idx;
     }
     debug!(
-        "scoring {} documents into {} candidates took {} ms.",
-        unique_docs,
+        "scoring into {} candidates took {} ms.",
         all_scored.len(),
         now.elapsed().as_millis()
     );
