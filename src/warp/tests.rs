@@ -57,7 +57,7 @@ mod tests {
     #[test]
     fn test_end_to_end() -> std::io::Result<()> {
 
-        let tmp = Builder::new().prefix("warp-").suffix(".db").tempfile()?;
+        let tmp = Builder::new().prefix("warp-e2e-").suffix(".db").tempfile()?;
         let (_file, path): (std::fs::File, PathBuf) = tmp.keep()?;
 
         let mut db = DB::new(path.clone()).unwrap();
@@ -116,7 +116,7 @@ mod tests {
 
     #[test]
     fn test_sub_docs() -> std::io::Result<()> {
-        let tmp = Builder::new().prefix("warp-").suffix(".db").tempfile()?;
+        let tmp = Builder::new().prefix("warp-subdoc-").suffix(".db").tempfile()?;
         let (_file, path): (std::fs::File, PathBuf) = tmp.keep()?;
 
         let mut db = DB::new(path.clone()).unwrap();
@@ -213,7 +213,7 @@ mod tests {
     #[test]
     fn test_open_corrupted_db() -> std::io::Result<()> {
         use std::io::Write;
-        let tmp = Builder::new().prefix("warp-").suffix(".db").tempfile()?;
+        let tmp = Builder::new().prefix("warp-corrupted-").suffix(".db").tempfile()?;
         let (mut file, path): (std::fs::File, PathBuf) = tmp.keep()?;
         let foo: u32 = 0xfede_abe0;
         file.write_all(&foo.to_le_bytes())?;

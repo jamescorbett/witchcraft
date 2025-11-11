@@ -38,14 +38,16 @@ impl DB {
             Err(_e) => false,
         };
 
-        // check app_id and user_version
-        let app_id: SQLResult<i32> = connection.query_row("PRAGMA application_id;", [], |r| r.get(0));
-        let user_version: SQLResult<i32> =
-            connection.query_row("PRAGMA user_version;", [], |r| r.get(0));
-
-        let schema_ok = matches!((app_id, user_version),
-            (Ok(a), Ok(v)) if a == APP_ID && v == EXPECTED_VERSION && a != 0 && v != 0
-        );
+        let schema_ok = if first_creation {
+            true
+        } else {
+            let app_id: SQLResult<i32> = connection.query_row("PRAGMA application_id;", [], |r| r.get(0));
+            let user_version: SQLResult<i32> =
+                connection.query_row("PRAGMA user_version;", [], |r| r.get(0));
+            matches!((app_id, user_version),
+                (Ok(a), Ok(v)) if a == APP_ID && v == EXPECTED_VERSION && a != 0 && v != 0
+            )
+        };
 
         let connection = if db_ok && schema_ok {
             connection
