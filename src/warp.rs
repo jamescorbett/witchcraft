@@ -83,7 +83,28 @@ pub mod progress {
     }
 }
 
-fn kmeans(data: &Tensor, k: usize, max_iter: usize, device: &Device) -> Result<(Tensor, Tensor)> {
+fn matmul_argmax_batched(t: &Tensor, centers_t: &Tensor, batch_size: usize) -> Result<Tensor> {
+    let (m, _n) = t.dims2()?;
+    let device = t.device();
+
+    let mut assignments = Vec::with_capacity(m);
+
+    for start in (0..m).step_by(batch_size) {
+        let end = (start + batch_size).min(m);
+        let batch_len = end - start;
+        let batch = t.narrow(0, start, batch_len)?;
+        let sim = batch.matmul(centers_t)?;
+
+        // Use vectorized argmax for CPU tensors
+        let batch_assignments = sim.argmax(D::Minus1)?;
+        let batch_assignments = batch_assignments.to_vec1::<u32>()?;
+        assignments.extend(batch_assignments);
+    }
+
+    Ok(Tensor::from_vec(assignments, m, device)?)
+}
+
+fn kmeans(data: &Tensor, k: usize, max_iter: usize, device: &Device) -> Result<Tensor> {
     let (m, n) = data.dims2()?;
     debug!("kmeans k={} m={} n={}...", k, m, n);
 
@@ -97,11 +118,10 @@ fn kmeans(data: &Tensor, k: usize, max_iter: usize, device: &Device) -> Result<(
     let centroid_idx_tensor = Tensor::from_slice(centroid_idx.as_slice(), (k,), device)?;
     let centroid_idx_tensor = centroid_idx_tensor.to_device(data.device())?;
     let mut centers = data.index_select(&centroid_idx_tensor, 0)?;
-    let mut cluster_assignments = Tensor::zeros((m,), DType::U32, device)?;
 
     for _ in 0..max_iter {
-        let sim = data.matmul(&centers.transpose(D::Minus1, D::Minus2)?)?;
-        cluster_assignments = sim.argmax(D::Minus1)?;
+        // Use batched matmul+argmax to avoid materializing huge [m, k] matrix
+        let cluster_assignments = matmul_argmax_batched(&data, &centers.transpose(D::Minus1, D::Minus2)?, 1024)?;
         let mut centers_vec = vec![];
         for i in 0..k {
             let mut indices = vec![];
@@ -132,7 +152,7 @@ fn kmeans(data: &Tensor, k: usize, max_iter: usize, device: &Device) -> Result<(
         centers = Tensor::stack(centers_vec.as_slice(), 0)?;
     }
     bar.finish();
-    Ok((centers, cluster_assignments))
+    Ok(centers)
 }
 
 fn compress_keys(keys: &[(u32, u32)]) -> Vec<u8> {
@@ -229,6 +249,7 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
     let mut batch = 0;
     let mut tmpfiles = vec![];
     let centers_cpu = centers.to_device(&Device::Cpu)?;
+    let centers_t = centers.transpose(D::Minus1, D::Minus2)?;
     while !done {
         match results.next() {
             Some(result) => {
@@ -268,8 +289,9 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
             let indices = document_indices.split_off(left);
             let data = Tensor::cat(&embeddings, 0)?.to_device(&device)?;
 
-            let sim = data.matmul(&centers.transpose(D::Minus1, D::Minus2)?)?;
-            let cluster_assignments = sim.argmax(D::Minus1)?.to_device(&Device::Cpu)?;
+            // Use batched matmul+argmax to avoid materializing huge intermediate matrix
+            let cluster_assignments = matmul_argmax_batched(&data, &centers_t, 1024)?.to_device(&Device::Cpu)?;
+            info!("simmax took {} ms", now.elapsed().as_millis());
             mmuls_total += now.elapsed().as_millis();
 
             let now = std::time::Instant::now();
@@ -1181,7 +1203,7 @@ pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
     if m < k {
         k = m / 4;
     }
-    let (centers, _idxs) = kmeans(&matrix, k as usize, 5, &device)?;
+    let centers = kmeans(&matrix, k as usize, 5, &Device::Cpu)?;
     debug!("kmeans took {} ms.", now.elapsed().as_millis());
 
     debug!("write buckets...");
