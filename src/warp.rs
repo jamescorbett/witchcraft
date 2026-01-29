@@ -27,6 +27,12 @@ pub mod rans64;
 
 mod merger;
 
+pub mod types;
+pub use types::SqlStatement;
+
+mod sql_generator;
+use sql_generator::build_filter_sql_and_params;
+
 use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor, D};
 
@@ -382,7 +388,7 @@ pub fn fulltext_search(
     db: &DB,
     q: &String,
     top_k: usize,
-    sql_filter: Option<&str>,
+    sql_filter: Option<&SqlStatement>,
 ) -> Result<Vec<(f32, u32, u32)>> {
     let mut fts_matches = vec![];
 
@@ -395,9 +401,17 @@ pub fn fulltext_search(
         .filter(|c| c.is_alphanumeric() || c.is_whitespace())
         .collect();
 
-    let filter = match sql_filter {
-        Some(filter) => format!("AND {filter}"),
-        _ => String::new(),
+    let (filter_sql, mut filter_params) = build_filter_sql_and_params(sql_filter)?;
+    let filter_clause = if !filter_sql.is_empty() {
+        format!("AND {}", filter_sql)
+    } else {
+        String::new()
+    };
+
+    let q_param = if last_is_space {
+        q.trim().to_string()
+    } else {
+        format!("{q}*")
     };
 
     let sql = if q.len() > 0 {
@@ -406,28 +420,34 @@ pub fn fulltext_search(
             bm25(document_fts) AS score
             FROM document,document_fts
             WHERE document.rowid = document_fts.rowid
-            AND document_fts MATCH ?1 {filter}
+            AND document_fts MATCH ? {filter_clause}
             ORDER BY score,date DESC
-            LIMIT ?2",
+            LIMIT ?",
         )
     } else {
+        // For empty query, we don't need the query param in the WHERE clause
         format!(
             "SELECT rowid,\"\",\"\",0.0
             FROM document
-            WHERE ?1 = ?1 {filter}
+            WHERE 1=1 {filter_clause}
             ORDER BY date DESC
-            LIMIT ?2",
+            LIMIT ?",
         )
     };
 
-    let q = if last_is_space {
-        q.trim()
-    } else {
-        &format!("{q}*").to_string()
-    };
-
     let mut query = db.query(&sql)?;
-    let results = query.query_map((&q, top_k), |row| {
+
+    // Build complete params list: query param (if q.len() > 0), filter params, top_k
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if q.len() > 0 {
+        params.push(Box::new(q_param.clone()));
+    }
+    params.append(&mut filter_params);
+    params.push(Box::new(top_k as i64));
+
+    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+    let results = query.query_map(param_refs.as_slice(), |row| {
         Ok((
             row.get::<_, u32>(0)?,
             row.get::<_, String>(1)?,
@@ -437,7 +457,7 @@ pub fn fulltext_search(
     })?;
     for result in results {
         let (rowid, body, lens, _score) = result?;
-        let score2 = strsim::jaro_winkler(&q, &body) as f32;
+        let score2 = strsim::jaro_winkler(&q_param, &body) as f32;
 
         let lens: Vec<usize> = lens
             .split(',')
@@ -449,7 +469,7 @@ pub fn fulltext_search(
         if lens.len() > 0 {
             let bodies = split_by_codepoints(&body, &lens);
             for (i, &b) in bodies.iter().enumerate() {
-                let score = strsim::jaro_winkler(&q, &b);
+                let score = strsim::jaro_winkler(&q_param, &b);
                 if score > max {
                     max = score;
                     i_max = i;
@@ -579,7 +599,7 @@ pub fn match_centroids(
     query_embeddings: &Tensor,
     threshold: f32,
     top_k: usize,
-    sql_filter: Option<&str>,
+    sql_filter: Option<&SqlStatement>,
 ) -> Result<Vec<(f32, u32, u32)>> {
     let max_generation = db
         .query("SELECT MAX(generation) FROM indexed_chunk")?
@@ -834,23 +854,33 @@ pub fn match_centroids(
         let _ = insert_temp_query.execute((idx, score, sub_idx));
     }
 
+    let (filter_sql, filter_params) = build_filter_sql_and_params(sql_filter)?;
+    let filter_clause = if !filter_sql.is_empty() {
+        format!("AND {}", filter_sql)
+    } else {
+        String::new()
+    };
+
     let sql = format!(
         "SELECT score,document.rowid,sub_idx
         FROM document,temp2
         WHERE document.rowid = temp2.rowid
-        {}
+        {filter_clause}
         ORDER BY score DESC
-        LIMIT ?1",
-        match sql_filter {
-            Some(filter) => format!("WHERE {filter}"),
-            _ => String::new(),
-        }
+        LIMIT ?",
     );
 
     let results_status: Result<Vec<(f32, u32, u32)>> = {
         let mut scored_documents_query = db.query(&sql)?;
+
+        // Build complete params list: filter params, top_k
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = filter_params;
+        params.push(Box::new(top_k as i64));
+
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
         let results = scored_documents_query
-            .query_map((top_k,), |row| {
+            .query_map(param_refs.as_slice(), |row| {
                 Ok((
                     row.get::<_, f32>(0)?,
                     row.get::<_, u32>(1)?,
@@ -1198,7 +1228,7 @@ pub fn search(
     threshold: f32,
     top_k: usize,
     use_fulltext: bool,
-    sql_filter: Option<&str>,
+    sql_filter: Option<&SqlStatement>,
 ) -> Result<Vec<(f32, String, String, u32)>> {
     let now = std::time::Instant::now();
 
