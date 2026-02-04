@@ -158,6 +158,12 @@ pub fn bulk_search(
 fn main() -> Result<()> {
     let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(LevelFilter::Debug));
 
+    // Log CPU feature flags
+    #[cfg(target_feature = "avx2")]
+    info!("AVX2 instructions enabled");
+    #[cfg(target_feature = "fma")]
+    info!("FMA instructions enabled");
+
     let args: Vec<String> = env::args().collect();
     let device = warp::make_device();
     let assets = std::path::PathBuf::from("assets");

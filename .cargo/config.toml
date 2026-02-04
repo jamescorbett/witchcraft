@@ -1,0 +1,6 @@
+# Cargo configuration for rust-warp
+
+# Enable AVX2 and FMA on Windows for better performance
+[target.'cfg(windows)']
+rustflags = ["-C", "target-feature=+avx2,+fma"]
+
