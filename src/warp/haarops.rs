@@ -2,7 +2,6 @@ use candle_core::{IndexOp, Result, Tensor};
 
 pub trait TensorHaarOps {
     fn haar_forward_tensor_cols(&self) -> Result<Tensor>;
-    fn haar_inverse_tensor_cols(&self) -> Result<Tensor>;
 }
 
 impl TensorHaarOps for Tensor {
@@ -14,20 +13,6 @@ impl TensorHaarOps for Tensor {
         for c in 0..cols {
             let mut col: Vec<f32> = self.i((.., c))?.to_vec1::<f32>()?;
             haar_forward_mirror_edge(&mut col);
-            out_cols.push(Tensor::from_vec(col, (rows,), dev)?);
-        }
-
-        Ok(Tensor::stack(&out_cols, 1)?)
-    }
-
-    fn haar_inverse_tensor_cols(&self) -> Result<Tensor> {
-        let (rows, cols) = self.dims2()?;
-        let dev = self.device();
-        let mut out_cols = Vec::with_capacity(cols);
-
-        for c in 0..cols {
-            let mut col: Vec<f32> = self.i((.., c))?.to_vec1::<f32>()?;
-            haar_inverse_mirror_edge(&mut col);
             out_cols.push(Tensor::from_vec(col, (rows,), dev)?);
         }
 
@@ -68,7 +53,7 @@ fn haar_forward_mirror_edge(x: &mut [f32]) {
 }
 
 #[inline(always)]
-fn haar_inverse_mirror_edge(x: &mut [f32]) {
+pub(crate) fn haar_inverse_mirror_edge(x: &mut [f32]) {
     let n0 = x.len();
     let mut tmp = vec![0.0f32; n0];
 

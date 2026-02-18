@@ -2,6 +2,7 @@ use anyhow::Result;
 use candle_core::{Device, Tensor};
 use log::warn;
 
+use super::haarops::haar_inverse_mirror_edge;
 use super::rans64;
 use super::TensorHaarOps;
 
@@ -110,9 +111,7 @@ pub trait TensorPackOps {
     fn inv_compand(&self) -> Result<Tensor>;
     fn quantize(&self, bits: u32) -> Result<Tensor>;
     fn dequantize(&self, bits: u32) -> Result<Tensor>;
-    fn l2_normalize(&self) -> Result<Tensor>;
     fn sort_by_column_sum(&self) -> Result<(Tensor, Vec<usize>)>;
-    fn restore_columns(&self, inv_perm: &[usize]) -> Result<Tensor>;
 
     fn embeddings_to_packed(&self) -> Result<Vec<u8>>;
     fn embeddings_from_packed(buffer: &[u8], cols: usize, device: &Device) -> Result<Tensor>;
@@ -192,14 +191,6 @@ impl TensorPackOps for Tensor {
         let idx_t = Tensor::from_vec(idx_i64, (cols,), self.device())?;
         let sorted = self.index_select(&idx_t, 1)?;
         Ok((sorted, inv_perm))
-    }
-
-    fn restore_columns(&self, inv_perm: &[usize]) -> Result<Tensor> {
-        let (_, cols) = self.dims2()?;
-        assert_eq!(cols, inv_perm.len());
-        let idx_i64: Vec<i64> = inv_perm.iter().map(|&i| i as i64).collect();
-        let idx_t = Tensor::from_vec(idx_i64, (cols,), self.device())?;
-        Ok(self.index_select(&idx_t, 1)?)
     }
 
     fn embeddings_to_packed(&self) -> Result<Vec<u8>> {
@@ -300,9 +291,10 @@ impl TensorPackOps for Tensor {
     fn embeddings_from_packed(bytes: &[u8], cols: usize, device: &Device) -> Result<Tensor> {
         let scale = 1.0 / RANGE;
 
-        let mut ts = vec![];
         let (head, mut bytes) = bytes.split_at(2);
         let rows = u16::from_ne_bytes(head.try_into().unwrap()) as usize;
+
+        let mut data = Vec::with_capacity(rows * cols);
 
         for (_offset, win_rows) in (0..rows)
             .step_by(MAX_WINDOW_ROWS)
@@ -320,32 +312,17 @@ impl TensorPackOps for Tensor {
                 .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
                 .collect();
 
-            // Find max symbol to size the lookup array
+            // Build merged lookup tables indexed directly by cumulative frequency
+            let rans_size = 1 << RANS_BITS;
+            let default_sym = rans64::RansDecSymbol::new(0, 1)?;
+            let mut cum2float: Vec<f32> = vec![0.0; rans_size];
+            let mut cum2sym: Vec<rans64::RansDecSymbol> = vec![default_sym; rans_size];
+
+            // First pass: build symbol -> float and symbol -> dec_symbol tables
             let mut max_symbol = 0u16;
             for i in 0..symbols_count {
-                let symbol = pairs[2 * i as usize];
-                max_symbol = max_symbol.max(symbol);
+                max_symbol = max_symbol.max(pairs[2 * i]);
             }
-
-            let mut cum = 0;
-            let mut cum2q: [u16; 1 << RANS_BITS] = [0; 1 << RANS_BITS];
-
-            // Use a sentinel value for unused symbols (0 freq, 0 start is safe but never used)
-            let default_sym = rans64::RansDecSymbol::new(0, 1)?;
-            let mut q2sym: Vec<rans64::RansDecSymbol> =
-                vec![default_sym; (max_symbol + 1) as usize];
-
-            for i in 0..symbols_count {
-                let symbol = pairs[2 * i as usize];
-                let freq = pairs[2 * i as usize + 1] as u32;
-                for c in cum..cum + freq {
-                    cum2q[c as usize] = symbol;
-                }
-                q2sym[symbol as usize] = rans64::RansDecSymbol::new(cum.into(), freq.into())?;
-                cum += freq;
-            }
-
-            // Pre-compute symbol -> float lookup table to eliminate branches in hot loop
             let mut q2float: Vec<f32> = Vec::with_capacity((max_symbol + 1) as usize);
             for q in 0..=max_symbol {
                 let x = if q == 0 {
@@ -359,45 +336,87 @@ impl TensorPackOps for Tensor {
                 q2float.push(x);
             }
 
+            let mut q2sym: Vec<rans64::RansDecSymbol> =
+                vec![rans64::RansDecSymbol::new(0, 1)?; (max_symbol + 1) as usize];
+
+            // Second pass: build cum -> (float, sym) merged tables
+            let mut cum = 0u32;
+            for i in 0..symbols_count {
+                let symbol = pairs[2 * i];
+                let freq = pairs[2 * i + 1] as u32;
+                let dec_sym = rans64::RansDecSymbol::new(cum, freq)?;
+                q2sym[symbol as usize] = dec_sym.clone();
+                let float_val = q2float[symbol as usize];
+                for c in cum..cum + freq {
+                    cum2float[c as usize] = float_val;
+                    cum2sym[c as usize] = dec_sym.clone();
+                }
+                cum += freq;
+            }
+
             let (head, tail) = tail.split_at(2);
             let compressed_size = u16::from_ne_bytes(head.try_into().unwrap()) as usize;
 
             let (head, tail) = tail.split_at(compressed_size);
             let mut decoder = rans64::RansDecoder::new(head.to_owned())?;
 
-            let mut t = Vec::with_capacity(win_rows * cols);
+            // Decode rANS directly into buffer in reverse order
+            let win_size = win_rows * cols;
+            let win_start = data.len();
+            data.resize(win_start + win_size, 0.0f32);
+            let t = &mut data[win_start..];
 
-            for _i in 0..(win_rows * cols) {
-                let cum = decoder.get(RANS_BITS);
-                let q = cum2q[cum as usize];
-                let x = q2float[q as usize];
-                t.push(x);
-
-                if let Err(e) = decoder.advance(&q2sym[q as usize], RANS_BITS) {
+            for i in (0..win_size).rev() {
+                let cum = decoder.get(RANS_BITS) as usize;
+                t[i] = cum2float[cum];
+                if let Err(e) = decoder.advance(&cum2sym[cum], RANS_BITS) {
                     warn!("RANS decoding failed");
                     return Err(e.into());
                 }
             }
-            t.reverse();
 
-            let rows = t.len() / cols;
-            assert!(rows == win_rows);
-            assert!(t.len() == rows * cols);
+            // Haar inverse on each row (contiguous in memory)
+            for r in 0..win_rows {
+                haar_inverse_mirror_edge(&mut t[r * cols..(r + 1) * cols]);
+            }
 
-            let t = Tensor::from_vec(t, &[rows, cols], device)?
-                .t()?
-                .haar_inverse_tensor_cols()?
-                .t()?
-                .haar_inverse_tensor_cols()?
-                .restore_columns(&idxs)?;
-            ts.push(t);
+            // Haar inverse on each column (strided, uses temp buffer)
+            let mut col_buf = vec![0.0f32; win_rows];
+            for c in 0..cols {
+                for r in 0..win_rows {
+                    col_buf[r] = t[r * cols + c];
+                }
+                haar_inverse_mirror_edge(&mut col_buf);
+                for r in 0..win_rows {
+                    t[r * cols + c] = col_buf[r];
+                }
+            }
+
+            // Restore column permutation in place
+            let mut row_buf = vec![0.0f32; cols];
+            for r in 0..win_rows {
+                let row_start = r * cols;
+                for c in 0..cols {
+                    row_buf[c] = t[row_start + idxs[c]];
+                }
+                t[row_start..row_start + cols].copy_from_slice(&row_buf);
+            }
 
             bytes = tail;
         }
         assert!(bytes.len() == 0);
 
-        let t = Tensor::cat(&ts, 0)?.l2_normalize()?;
-        Ok(t)
+        // L2 normalize all rows
+        for r in 0..rows {
+            let row = &mut data[r * cols..(r + 1) * cols];
+            let norm_sq: f32 = row.iter().map(|x| x * x).sum();
+            let inv_norm = 1.0 / norm_sq.sqrt();
+            for x in row.iter_mut() {
+                *x *= inv_norm;
+            }
+        }
+
+        Ok(Tensor::from_vec(data, &[rows, cols], device)?)
     }
 
     fn to_q4_bytes(&self) -> Result<Vec<u8>> {
@@ -500,9 +519,6 @@ impl TensorPackOps for Tensor {
     }
     */
 
-    fn l2_normalize(&self) -> Result<Tensor> {
-        Ok(self.broadcast_div(&self.sqr()?.sum_keepdim(1)?.sqrt()?)?)
-    }
 }
 
 /*
