@@ -17,7 +17,7 @@ use warp::DB;
 struct SimpleLogger;
 impl log::Log for SimpleLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= Level::Info
+        metadata.level() <= Level::Trace
     }
 
     fn log(&self, record: &Record) {
@@ -182,6 +182,9 @@ fn main() -> Result<()> {
     } else if args.len() == 2 && &args[1] == "index" {
         let db = DB::new(db_name).unwrap();
         warp::index_chunks(&db, &device).unwrap();
+    } else if args.len() == 2 && &args[1] == "reindex" {
+        let db = DB::new(db_name).unwrap();
+        warp::full_index(&db, &device).unwrap();
     } else if args.len() >= 3 && (args[1] == "query" || args[1] == "hybrid") {
         let db = DB::new_reader(db_name).unwrap();
         let q = &args[2..].join(" ");
@@ -220,7 +223,7 @@ fn main() -> Result<()> {
         let mut db = DB::new(db_name).unwrap();
         let _ = db.clear();
     } else {
-        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | index | query <text> | hybrid <text> | querycsv <file> <results-file> ***\n", args[0]);
+        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | index | reindex | query <text> | hybrid <text> | querycsv <file> <results-file> ***\n", args[0]);
     };
     Ok(())
 }

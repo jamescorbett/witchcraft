@@ -1215,7 +1215,7 @@ fn run_kmeans_for_index(matrix: &Tensor, total_embeddings: usize) -> Result<Tens
     Ok(centers)
 }
 
-fn full_index(db: &DB, device: &Device) -> Result<()> {
+pub fn full_index(db: &DB, device: &Device) -> Result<()> {
     debug!("read all embeddings for full index...");
     let (matrix, total_embeddings) =
         sample_embeddings_for_kmeans(db, "SELECT chunk.embeddings FROM chunk", device)?;
