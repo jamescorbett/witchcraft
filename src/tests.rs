@@ -1,7 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::warp;
-    use crate::warp::DB;
+    use crate::DB;
     use std::path::PathBuf;
     use tempfile::tempdir;
     use test_log::test;
@@ -61,10 +60,10 @@ mod tests {
         let mut db = DB::new(path.clone()).unwrap();
         let mut reader_db = DB::new_reader(path.clone()).unwrap();
 
-        let device = warp::make_device();
+        let device = crate::make_device();
         let assets = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/assets"));
-        let embedder = warp::Embedder::new(&device, &assets).unwrap();
-        let mut cache = warp::EmbeddingsCache::new(4);
+        let embedder = crate::Embedder::new(&device, &assets).unwrap();
+        let mut cache = crate::EmbeddingsCache::new(4);
 
         let mut uuids = vec![];
         for body in FACTS {
@@ -74,12 +73,12 @@ mod tests {
                 .unwrap();
         }
         for round in 0..3 {
-            warp::embed_chunks(&db, &embedder, None).unwrap();
+            crate::embed_chunks(&db, &embedder, None).unwrap();
             db.refresh_ft().unwrap();
             for (i, (q, pos)) in QUERIES.iter().enumerate() {
                 let use_fulltext = round == 0;
                 println!("searching for {q}");
-                let results = warp::search(
+                let results = crate::search(
                     &reader_db,
                     &embedder,
                     &mut cache,
@@ -107,9 +106,9 @@ mod tests {
                 }
             }
             db.remove_doc(&uuids[0].clone()).unwrap();
-            warp::index_chunks(&db, &device).unwrap();
+            crate::index_chunks(&db, &device).unwrap();
         }
-        let _ = warp::search(
+        let _ = crate::search(
             &reader_db,
             &embedder,
             &mut cache,
@@ -140,10 +139,10 @@ mod tests {
         let path: PathBuf = dir.path().join("warp");
 
         let mut db = DB::new(path.clone()).unwrap();
-        let device = warp::make_device();
+        let device = crate::make_device();
         let assets = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/assets"));
-        let embedder = warp::Embedder::new(&device, &assets).unwrap();
-        let mut cache = warp::EmbeddingsCache::new(4);
+        let embedder = crate::Embedder::new(&device, &assets).unwrap();
+        let mut cache = crate::EmbeddingsCache::new(4);
 
         let mut lens = vec![];
         for fact in FACTS {
@@ -155,7 +154,7 @@ mod tests {
             .unwrap();
 
         for (q, pos) in QUERIES {
-            let results = warp::search(
+            let results = crate::search(
                 &db,
                 &embedder,
                 &mut cache,
@@ -171,7 +170,7 @@ mod tests {
             }
         }
         for (q, pos) in EASY_QUERIES {
-            let results = warp::search(
+            let results = crate::search(
                 &db,
                 &embedder,
                 &mut cache,
@@ -197,10 +196,10 @@ mod tests {
         let path: PathBuf = dir.path().join("warp");
         let mut db = DB::new(path.clone()).unwrap();
 
-        let device = warp::make_device();
+        let device = crate::make_device();
         let assets = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/assets"));
-        let embedder = warp::Embedder::new(&device, &assets).unwrap();
-        let mut cache = warp::EmbeddingsCache::new(4);
+        let embedder = crate::Embedder::new(&device, &assets).unwrap();
+        let mut cache = crate::EmbeddingsCache::new(4);
 
         // Phase 1: Insert initial documents, embed and full-index
         let mut uuids = vec![];
@@ -210,11 +209,11 @@ mod tests {
             db.add_doc(&uuid, None, &uuid.to_string(), &body, None)
                 .unwrap();
         }
-        warp::embed_chunks(&db, &embedder, None).unwrap();
-        warp::index_chunks(&db, &device).unwrap();
+        crate::embed_chunks(&db, &embedder, None).unwrap();
+        crate::index_chunks(&db, &device).unwrap();
 
         // Verify search works after full index
-        let results = warp::search(
+        let results = crate::search(
             &db,
             &embedder,
             &mut cache,
@@ -240,11 +239,11 @@ mod tests {
             db.add_doc(&uuid, None, &uuid.to_string(), &body, None)
                 .unwrap();
         }
-        warp::embed_chunks(&db, &embedder, None).unwrap();
-        warp::index_chunks(&db, &device).unwrap(); // should trigger incremental
+        crate::embed_chunks(&db, &embedder, None).unwrap();
+        crate::index_chunks(&db, &device).unwrap(); // should trigger incremental
 
         // Verify search finds both old and new documents
-        let results = warp::search(
+        let results = crate::search(
             &db,
             &embedder,
             &mut cache,
@@ -260,7 +259,7 @@ mod tests {
             "should still find flamingo fact after incremental index"
         );
 
-        let results = warp::search(
+        let results = crate::search(
             &db,
             &embedder,
             &mut cache,
@@ -305,11 +304,11 @@ mod tests {
             db.add_doc(&uuid, None, &uuid.to_string(), &body, None)
                 .unwrap();
         }
-        warp::embed_chunks(&db, &embedder, None).unwrap();
-        warp::index_chunks(&db, &device).unwrap(); // should trigger full re-index (compaction)
+        crate::embed_chunks(&db, &embedder, None).unwrap();
+        crate::index_chunks(&db, &device).unwrap(); // should trigger full re-index (compaction)
 
         // Verify search still works after compaction
-        let results = warp::search(
+        let results = crate::search(
             &db,
             &embedder,
             &mut cache,
@@ -325,7 +324,7 @@ mod tests {
             "should still find flamingo fact after compaction"
         );
 
-        let results = warp::search(
+        let results = crate::search(
             &db,
             &embedder,
             &mut cache,
@@ -348,10 +347,10 @@ mod tests {
 
     #[test]
     fn test_scoring() -> std::io::Result<()> {
-        let device = warp::make_device();
+        let device = crate::make_device();
         let assets = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/assets"));
-        let embedder = warp::Embedder::new(&device, &assets).unwrap();
-        let mut cache = warp::EmbeddingsCache::new(4);
+        let embedder = crate::Embedder::new(&device, &assets).unwrap();
+        let mut cache = crate::EmbeddingsCache::new(4);
         let sentences = [
             "The inventor of the frisbee was turned into a frisbee after he died.",
             "There's an island in Japan where bunnies outnumber people.",
@@ -366,7 +365,7 @@ mod tests {
         let query = "what wash the shortest war ever?";
         for _ in 0..2 {
             let scores =
-                warp::score_query_sentences(&embedder, &mut cache, &query.to_string(), &sentences)
+                crate::score_query_sentences(&embedder, &mut cache, &query.to_string(), &sentences)
                     .unwrap();
             let mut max = -1.0f32;
             let mut i_max = 0usize;
@@ -384,9 +383,9 @@ mod tests {
 
     #[test]
     fn test_embedder_without_assets() -> std::io::Result<()> {
-        let device = warp::make_device();
+        let device = crate::make_device();
         let assets = std::path::PathBuf::from("assets.notfound");
-        match warp::Embedder::new(&device, &assets) {
+        match crate::Embedder::new(&device, &assets) {
             Ok(_embedder) => {
                 unreachable!("should fail to create embedder without assets!");
             }

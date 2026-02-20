@@ -12,7 +12,7 @@ name = "quantize-tool"          # !Dash
 path = "src/quantize-tool.rs"   # !Dash
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 path = "src/lib.rs"
 
 [dependencies]

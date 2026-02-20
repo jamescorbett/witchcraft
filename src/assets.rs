@@ -72,13 +72,13 @@ impl Asset {
 macro_rules! embed_zst_asset {
     ($vis:vis $name:ident, $path:literal) => {
         #[cfg(feature = "embed-assets")]
-        $vis static $name: $crate::warp::assets::Asset =
-            $crate::warp::assets::Asset::new_embedded(include_bytes!(
+        $vis static $name: $crate::assets::Asset =
+            $crate::assets::Asset::new_embedded(include_bytes!(
                 concat!(env!("CARGO_MANIFEST_DIR"), "/assets/", $path)
             ));
 
         #[cfg(not(feature = "embed-assets"))]
-        $vis static $name: $crate::warp::assets::Asset =
-            $crate::warp::assets::Asset::new_file($path);
+        $vis static $name: $crate::assets::Asset =
+            $crate::assets::Asset::new_file($path);
     };
 }

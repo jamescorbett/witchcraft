@@ -10,7 +10,6 @@ use text_splitter::TextSplitter;
 use uuid::Uuid;
 
 mod histogram;
-mod warp;
 
 use warp::DB;
 
