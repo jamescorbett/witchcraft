@@ -525,48 +525,37 @@ pub fn reciprocal_rank_fusion(list1: &[u32], list2: &[u32], k: f64) -> Vec<u32> 
     results
 }
 
-struct CachedTensor {
-    version: u64,
-    cluster_ids: Vec<u32>,
-    sizes: Vec<usize>,
-    centers: Vec<Tensor>,
-    tensor: Tensor,
-}
+type CentersCache = (Vec<u32>, Vec<usize>, Vec<Tensor>, Tensor);
 
-static CACHED: Lazy<RwLock<Option<CachedTensor>>> = Lazy::new(|| RwLock::new(None));
-static CACHED_VERSION: Lazy<RwLock<Option<u64>>> = Lazy::new(|| RwLock::new(None));
+static CACHED: Lazy<RwLock<Option<CentersCache>>> = Lazy::new(|| RwLock::new(None));
 
 fn invalidate_center_cache() {
     *CACHED.write().unwrap() = None;
-    *CACHED_VERSION.write().unwrap() = None;
 }
 
 fn get_centers(
     db: &DB,
     device: &Device,
-    version: u64,
 ) -> Result<(Vec<u32>, Vec<usize>, Vec<Tensor>, Tensor)> {
     let now = std::time::Instant::now();
     {
         let cache_lock_start = std::time::Instant::now();
         let cache = CACHED.read().unwrap();
         let lock_time = cache_lock_start.elapsed().as_micros();
-        if let Some(cached) = &*cache {
-            if cached.version == version {
-                let clone_start = std::time::Instant::now();
-                let result = Ok((
-                    cached.cluster_ids.clone(),
-                    cached.sizes.clone(),
-                    cached.centers.clone(),
-                    cached.tensor.clone(),
-                ));
-                debug!(
-                    "get_centers cache hit: lock {}μs, clone {}μs",
-                    lock_time,
-                    clone_start.elapsed().as_micros()
-                );
-                return result;
-            }
+        if let Some((cluster_ids, sizes, centers, tensor)) = &*cache {
+            let clone_start = std::time::Instant::now();
+            let result = Ok((
+                cluster_ids.clone(),
+                sizes.clone(),
+                centers.clone(),
+                tensor.clone(),
+            ));
+            debug!(
+                "get_centers cache hit: lock {}μs, clone {}μs",
+                lock_time,
+                clone_start.elapsed().as_micros()
+            );
+            return result;
         }
     }
 
@@ -598,13 +587,12 @@ fn get_centers(
     );
 
     let mut cache = CACHED.write().unwrap();
-    *cache = Some(CachedTensor {
-        version: version,
-        cluster_ids: cluster_ids.clone(),
-        sizes: sizes.clone(),
-        centers: centers.clone(),
-        tensor: tensor.clone(),
-    });
+    *cache = Some((
+        cluster_ids.clone(),
+        sizes.clone(),
+        centers.clone(),
+        tensor.clone(),
+    ));
 
     Ok((cluster_ids, sizes, centers, tensor))
 }
@@ -643,24 +631,6 @@ pub fn match_centroids(
     let total_start = std::time::Instant::now();
     let setup_start = std::time::Instant::now();
 
-    let version_start = std::time::Instant::now();
-    // Check cached version first to avoid expensive DB query
-    let cache_version: u64 = {
-        let cached_ver = CACHED_VERSION.read().unwrap();
-        if let Some(ver) = *cached_ver {
-            ver
-        } else {
-            drop(cached_ver); // Release read lock before acquiring write lock
-            let ver = db
-                .query("SELECT IFNULL(MAX(id), 0) + COUNT(*) FROM bucket")?
-                .query_row((), |row| Ok(row.get::<_, u64>(0)?))
-                .unwrap_or(0);
-            *CACHED_VERSION.write().unwrap() = Some(ver);
-            ver
-        }
-    };
-    let version_time = version_start.elapsed().as_millis();
-
     let query_prep_start = std::time::Instant::now();
     let mut bucket_query =
         db.query("SELECT indices,residuals FROM bucket WHERE id = ?1")?;
@@ -680,12 +650,11 @@ pub fn match_centroids(
 
     let centers_start = std::time::Instant::now();
     let (cluster_ids, sizes, centers, centers_matrix) =
-        get_centers(&db, &device, cache_version)?;
+        get_centers(&db, &device)?;
     let centers_time = centers_start.elapsed().as_millis();
 
     debug!(
-        "setup: version query {}ms, bucket query prep {}ms, get_centers {}ms, total {}ms",
-        version_time,
+        "setup: bucket query prep {}ms, get_centers {}ms, total {}ms",
         query_prep_time,
         centers_time,
         setup_start.elapsed().as_millis()
