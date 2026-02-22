@@ -671,10 +671,12 @@ pub fn match_centroids(
     let device = query_embeddings.device();
     let (m, _n) = query_embeddings.dims2()?;
 
-    let mut all_document_embeddings = vec![];
+    let mut all_residuals = vec![]; // Store residuals, not full embeddings
+    let mut document_clusters = vec![]; // Track which cluster each document belongs to
     let mut all = vec![];
     let mut count = 0;
     let mut missing = vec![];
+    let mut query_centroid_scores: Vec<Vec<f32>> = vec![]; // Centroid scores for reuse
 
     let centers_start = std::time::Instant::now();
     let (cluster_ids, sizes, centers, centers_matrix) =
@@ -695,6 +697,9 @@ pub fn match_centroids(
         let query_centroid_similarity =
             query_embeddings.matmul(&centers_matrix.transpose(D::Minus1, D::Minus2)?)?;
         let query_centroid_similarity = query_centroid_similarity.to_device(&Device::Cpu)?;
+
+        // Extract centroid scores for later use (m queries × n_clusters)
+        query_centroid_scores = query_centroid_similarity.to_vec2::<f32>()?;
 
         let sorted_indices = query_centroid_similarity.arg_sort_last_dim(false)?;
         let (m, n) = sorted_indices.dims2()?;
@@ -737,7 +742,6 @@ pub fn match_centroids(
         let mut db_read_time = 0u128;
         let mut decompress_time = 0u128;
         let mut dequant_time = 0u128;
-        let mut add_centroid_time = 0u128;
 
         for i in topk_clusters {
             let db_start = std::time::Instant::now();
@@ -748,13 +752,12 @@ pub fn match_centroids(
             db_read_time += db_start.elapsed().as_millis();
 
             match centers.get(i as usize) {
-                Some(center) => {
+                Some(_center) => {
                     let decompress_start = std::time::Instant::now();
                     let document_indices = decompress_keys(&keys_compressed)?;
                     decompress_time += decompress_start.elapsed().as_millis();
 
                     let dequant_start = std::time::Instant::now();
-                    //let residuals = Tensor::from_q4_bytes(&document_embeddings, EMBEDDING_DIM, &device)?.dequantize(4)?.inv_compand()?;
                     let residuals = Tensor::from_companded_q4_bytes(
                         &document_embeddings,
                         EMBEDDING_DIM,
@@ -763,13 +766,11 @@ pub fn match_centroids(
                     )?;
                     dequant_time += dequant_start.elapsed().as_millis();
 
-                    let add_start = std::time::Instant::now();
-                    let embeddings = residuals.broadcast_add(&center)?;
-                    all_document_embeddings.push(embeddings);
-                    add_centroid_time += add_start.elapsed().as_millis();
-
-                    let (m, _) = residuals.dims2()?;
-                    for j in 0..m {
+                    // Store residuals (not embeddings) and track cluster membership
+                    let (num_docs, _) = residuals.dims2()?;
+                    all_residuals.push(residuals);
+                    for j in 0..num_docs {
+                        document_clusters.push(i as usize); // Track which cluster this doc belongs to
                         all.push((document_indices[j], count));
                         count += 1;
                     }
@@ -780,13 +781,12 @@ pub fn match_centroids(
             }
         }
         debug!(
-            "reading {} indexed embeddings took {} ms (DB: {}ms, decompress keys: {}ms, dequant: {}ms, add centroids: {}ms).",
+            "reading {} indexed embeddings took {} ms (DB: {}ms, decompress keys: {}ms, dequant: {}ms).",
             count,
             now.elapsed().as_millis(),
             db_read_time,
             decompress_time,
-            dequant_time,
-            add_centroid_time
+            dequant_time
         );
     } else {
         for _ in 0..m {
@@ -805,6 +805,7 @@ pub fn match_centroids(
 
     let now = std::time::Instant::now();
     let mut num_unindexed = 0;
+    let mut unindexed_embeddings = vec![];
 
     // Check if there are any unindexed chunks before running expensive query
     let unindexed_count: u32 = db
@@ -831,14 +832,14 @@ pub fn match_centroids(
         for result in results {
             let (id, embeddings) = result?;
             let embeddings = Tensor::embeddings_from_packed(&embeddings, EMBEDDING_DIM, &Device::Cpu)?;
-            let (m, _) = embeddings.dims2()?;
-            all_document_embeddings.push(embeddings);
-            for _ in 0..m {
+            let (num_docs, _) = embeddings.dims2()?;
+            unindexed_embeddings.push(embeddings);
+            for _ in 0..num_docs {
                 let key = (id, 0);
                 all.push((key, count));
                 count += 1;
             }
-            num_unindexed += m;
+            num_unindexed += num_docs;
         }
     }
     debug!(
@@ -847,36 +848,65 @@ pub fn match_centroids(
         now.elapsed().as_millis()
     );
 
-    if all_document_embeddings.len() == 0 {
+    if count == 0 {
         return Ok(vec![]);
     }
 
     let now = std::time::Instant::now();
-    let all_document_embeddings = Tensor::cat(&all_document_embeddings, 0)?;
-    let all_document_embeddings = all_document_embeddings.to_device(query_embeddings.device())?;
+    let n = m; // Number of queries
+
+    let mut sim: Vec<f32> = Vec::with_capacity(count * n);
+
+    // Process indexed embeddings: compute query·residuals and add centroid scores
+    if all_residuals.len() > 0 {
+        let all_residuals = Tensor::cat(&all_residuals, 0)?;
+        let all_residuals = all_residuals.to_device(query_embeddings.device())?;
+
+        let residual_sims = query_embeddings
+            .matmul(&all_residuals.t()?)?
+            .transpose(0, 1)?;
+        let residual_sims = residual_sims.to_device(&Device::Cpu)?;
+        let residual_sims = residual_sims.to_dtype(DType::F32)?.contiguous()?;
+        let (num_indexed, _) = residual_sims.dims2()?;
+
+        // Add centroid scores to get final similarities for indexed documents
+        let mut residual_sims_flat = residual_sims.flatten_all()?.to_vec1::<f32>()?;
+        for doc_idx in 0..num_indexed {
+            let cluster_idx = document_clusters[doc_idx];
+            for query_idx in 0..n {
+                let offset = doc_idx * n + query_idx;
+                residual_sims_flat[offset] += query_centroid_scores[query_idx][cluster_idx];
+            }
+        }
+        sim.extend_from_slice(&residual_sims_flat);
+    }
+
+    // Process unindexed embeddings: compute full similarities
+    if unindexed_embeddings.len() > 0 {
+        let all_unindexed = Tensor::cat(&unindexed_embeddings, 0)?;
+        let all_unindexed = all_unindexed.to_device(query_embeddings.device())?;
+
+        let unindexed_sims = query_embeddings
+            .matmul(&all_unindexed.t()?)?
+            .transpose(0, 1)?;
+        let unindexed_sims = unindexed_sims.to_device(&Device::Cpu)?;
+        let unindexed_sims = unindexed_sims.to_dtype(DType::F32)?.contiguous()?;
+        let unindexed_sims_flat = unindexed_sims.flatten_all()?.to_vec1::<f32>()?;
+        sim.extend_from_slice(&unindexed_sims_flat);
+    }
+
     debug!(
-        "concatenating and moving {} embedding chunks took {} ms.",
-        all_document_embeddings.dims2()?.0,
+        "computing similarities for {} total embeddings took {} ms.",
+        count,
         now.elapsed().as_millis()
     );
 
-    let now = std::time::Instant::now();
-    let sim = query_embeddings
-        .matmul(&all_document_embeddings.t()?)?
-        .transpose(0, 1)?;
-    let sim = sim.to_device(&Device::Cpu)?;
-
-    let sim = sim.to_dtype(DType::F32)?.contiguous()?;
-    let (_, n) = sim.dims2()?;
-    let sim: Vec<f32> = sim.flatten_all()?.to_vec1::<f32>()?;
     let row_at = |pos: usize| -> &[f32] {
         let start = pos * n;
         &sim[start..start + n]
     };
 
     let missing_similarities = missing_similarities.contiguous()?.to_vec1::<f32>()?;
-
-    debug!("sim mmul took {} ms.", now.elapsed().as_millis());
 
     let now = std::time::Instant::now();
     all.sort_unstable();
