@@ -60,7 +60,8 @@ use candle_core::{DType, Device, IndexOp, Tensor, D};
 const EMBEDDING_DIM: usize = 128;
 
 pub fn make_device() -> Device {
-    if cfg!(target_os = "macos") {
+    // Metal only works on Apple Silicon (ARM), not Intel x86_64
+    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         match Device::new_metal(0) {
             Ok(device) => device,
             Err(v) => {

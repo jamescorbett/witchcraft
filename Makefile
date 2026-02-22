@@ -16,16 +16,16 @@ assets/xtr.gguf.zst: xtr.safetensors
 download: assets/config.json.zst assets/tokenizer.json.zst assets/xtr.safetensors.zst assets/xtr.gguf.zst
 
 build: download
-	RUSTFLAGS='-C target-feature=+neon' cargo build --release --target aarch64-apple-darwin --features accelerate
+	RUSTFLAGS='-C target-feature=+neon' cargo build --release --target aarch64-apple-darwin --features metal,accelerate
 	ln -vf target/aarch64-apple-darwin/release/libwarp.dylib target/release/warp.node
 
 buildemb: download
-	cargo build --release --target aarch64-apple-darwin --features accelerate,embed-assets
+	cargo build --release --target aarch64-apple-darwin --features metal,accelerate,embed-assets
 	cargo build --release --target x86_64-apple-darwin --features accelerate,embed-assets
 	ln -vf target/aarch64-apple-darwin/release/libwarp.dylib target/release/warp.node
 
 module:
-	cargo build --release --target aarch64-apple-darwin --features accelerate
+	cargo build --release --target aarch64-apple-darwin --features metal,accelerate
 	cargo build --release --target x86_64-apple-darwin --features accelerate
 	lipo -create target/aarch64-apple-darwin/release/libwarp.dylib target/x86_64-apple-darwin/release/libwarp.dylib -output target/release/warp-macos-universal.node
 
