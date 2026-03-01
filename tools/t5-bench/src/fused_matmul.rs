@@ -121,6 +121,17 @@ impl CustomOp1 for QTiledOp {
     }
 }
 
+// ---- Fast tanh via Padé [3,3] rational approximation ----
+// Pure polynomial ratio (no transcendentals) — auto-vectorizes with AVX2.
+
+#[inline(always)]
+fn fast_tanh(x: f32) -> f32 {
+    let x = x.clamp(-4.97, 4.97);
+    let x2 = x * x;
+    x * (135135.0 + x2 * (17325.0 + x2 * (378.0 + x2)))
+        / (135135.0 + x2 * (62370.0 + x2 * (3150.0 + 28.0 * x2)))
+}
+
 // ---- Fused gated-gelu matmul ----
 
 fn fused_gated_gelu_inner<T: GgmlType>(
@@ -156,7 +167,7 @@ fn fused_gated_gelu_inner<T: GgmlType>(
                 let up = T::vec_dot(k, up_col, lhs_row);
                 let gate = 0.5 * gate
                     * (1.0
-                        + f32::tanh(0.7978845608_f32 * gate * (1.0 + 0.044715 * gate * gate)));
+                        + fast_tanh(0.7978845608_f32 * gate * (1.0 + 0.044715 * gate * gate)));
                 unsafe {
                     *dst.add(row_idx * n + col_idx) = gate * up;
                 }
