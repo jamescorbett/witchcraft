@@ -291,8 +291,13 @@ impl Module for T5LayerFF {
 
 #[derive(Debug, Clone)]
 struct T5Attention {
+    #[cfg(feature = "fused-gelu")]
+    qkv: QMatMul,
+    #[cfg(not(feature = "fused-gelu"))]
     q: QMatMul,
+    #[cfg(not(feature = "fused-gelu"))]
     k: QMatMul,
+    #[cfg(not(feature = "fused-gelu"))]
     v: QMatMul,
     o: QMatMul,
     n_heads: usize,
@@ -307,12 +312,13 @@ impl T5Attention {
     fn load(has_relative_attention_bias: bool, vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let inner_dim = cfg.num_heads * cfg.d_kv;
         #[cfg(feature = "fused-gelu")]
-        let (q, k, v, o) = {
-            let q = new_qmm_dequant(cfg.d_model, inner_dim, vb.pp("q"))?;
-            let k = new_qmm_dequant(cfg.d_model, inner_dim, vb.pp("k"))?;
-            let v = new_qmm_dequant(cfg.d_model, inner_dim, vb.pp("v"))?;
+        let (qkv, o) = {
+            let q_w = vb.pp("q").get((inner_dim, cfg.d_model), "weight")?.dequantize(vb.device())?;
+            let k_w = vb.pp("k").get((inner_dim, cfg.d_model), "weight")?.dequantize(vb.device())?;
+            let v_w = vb.pp("v").get((inner_dim, cfg.d_model), "weight")?.dequantize(vb.device())?;
+            let qkv = QMatMul::from_tensor(Tensor::cat(&[&q_w, &k_w, &v_w], 0)?);
             let o = new_qmm_dequant(inner_dim, cfg.d_model, vb.pp("o"))?;
-            (q, k, v, o)
+            (qkv, o)
         };
         #[cfg(not(feature = "fused-gelu"))]
         let (q, k, v, o) = {
@@ -333,8 +339,13 @@ impl T5Attention {
             None
         };
         Ok(Self {
+            #[cfg(feature = "fused-gelu")]
+            qkv,
+            #[cfg(not(feature = "fused-gelu"))]
             q,
+            #[cfg(not(feature = "fused-gelu"))]
             k,
+            #[cfg(not(feature = "fused-gelu"))]
             v,
             o,
             n_heads: cfg.num_heads,
@@ -353,32 +364,48 @@ impl T5Attention {
         key_value_states: Option<&Tensor>,
         mask: Option<&Tensor>,
     ) -> Result<(Tensor, Option<Tensor>)> {
-        // Performs Self-attention (if key_value_states is None) or attention
-        // over source sentence (provided by key_value_states).
-        let kv_input = match key_value_states {
-            None => xs,
-            Some(key_value_states) => key_value_states,
-        };
         let (b_sz, q_len) = (xs.dim(0)?, xs.dim(1)?);
-        let kv_len = kv_input.dim(1)?;
-        let q = self.q.forward(xs)?;
-        let k = self.k.forward(kv_input)?;
-        let v = self.v.forward(kv_input)?;
-        let q = q
-            .reshape((b_sz, q_len, self.n_heads, self.d_kv))?
-            .transpose(1, 2)?
-            .contiguous()?;
-        let k = k
-            .reshape((b_sz, kv_len, self.n_heads, self.d_kv))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b_sz, kv_len, self.n_heads, self.d_kv))?
-            .transpose(1, 2)?;
 
-        let k = k.contiguous()?;
-        let v = v.contiguous()?;
-        // TODO: Use flash_attn.
-        let scores = { q.matmul(&k.t()?)? };
+        #[cfg(feature = "fused-gelu")]
+        let (q, k, v) = {
+            let _ = key_value_states;
+            let qkv = self.qkv.forward(xs)?;
+            let qkv = qkv
+                .reshape((b_sz, q_len, 3, self.n_heads, self.d_kv))?
+                .permute((2, 0, 3, 1, 4))?
+                .contiguous()?;
+            (
+                qkv.narrow(0, 0, 1)?.squeeze(0)?,
+                qkv.narrow(0, 1, 1)?.squeeze(0)?,
+                qkv.narrow(0, 2, 1)?.squeeze(0)?,
+            )
+        };
+        #[cfg(not(feature = "fused-gelu"))]
+        let (q, k, v) = {
+            let kv_input = match key_value_states {
+                None => xs,
+                Some(key_value_states) => key_value_states,
+            };
+            let kv_len = kv_input.dim(1)?;
+            let q = self.q.forward(xs)?;
+            let k = self.k.forward(kv_input)?;
+            let v = self.v.forward(kv_input)?;
+            let q = q
+                .reshape((b_sz, q_len, self.n_heads, self.d_kv))?
+                .transpose(1, 2)?
+                .contiguous()?;
+            let k = k
+                .reshape((b_sz, kv_len, self.n_heads, self.d_kv))?
+                .transpose(1, 2)?
+                .contiguous()?;
+            let v = v
+                .reshape((b_sz, kv_len, self.n_heads, self.d_kv))?
+                .transpose(1, 2)?
+                .contiguous()?;
+            (q, k, v)
+        };
+
+        let scores = q.matmul(&k.t()?)?;
         let scores = match mask {
             None => scores,
             Some(mask) => masked_fill(
@@ -448,7 +475,7 @@ impl T5Attention {
             },
         };
 
-        let attn_weights = { candle_nn::ops::softmax_last_dim(&scores)? };
+        let attn_weights = candle_nn::ops::softmax_last_dim(&scores)?;
         let attn_output = attn_weights.matmul(&v)?;
         let attn_output = attn_output
             .transpose(1, 2)?
