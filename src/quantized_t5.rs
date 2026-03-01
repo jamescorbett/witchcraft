@@ -395,10 +395,13 @@ impl T5Attention {
         };
 
         let (scores, position_bias) = match position_bias {
-            Some(position_bias) => (
-                scores.broadcast_add(position_bias)?,
-                Some(position_bias.clone()),
-            ),
+            Some(position_bias) => {
+                #[cfg(feature = "fused-gelu")]
+                let scores = crate::fused_matmul::fast_add(&scores, position_bias)?;
+                #[cfg(not(feature = "fused-gelu"))]
+                let scores = scores.broadcast_add(position_bias)?;
+                (scores, Some(position_bias.clone()))
+            }
             None => match &self.relative_attention_bias {
                 None => (scores, None),
                 Some(relative_attention_bias) => {
@@ -443,9 +446,13 @@ impl T5Attention {
                     let position_bias = relative_attention_bias
                         .forward(&relative_buckets)?
                         .permute((2, 0, 1))?
-                        .unsqueeze(0)?;
-                    (scores.broadcast_add(&position_bias)?, Some(position_bias))
-                    // TODO: position_bias_masked?
+                        .unsqueeze(0)?
+                        .contiguous()?;
+                    #[cfg(feature = "fused-gelu")]
+                    let scores = crate::fused_matmul::fast_add(&scores, &position_bias)?;
+                    #[cfg(not(feature = "fused-gelu"))]
+                    let scores = scores.broadcast_add(&position_bias)?;
+                    (scores, Some(position_bias))
                 }
             },
         };
