@@ -338,6 +338,21 @@ fn get_rss_mb() -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Test if repeatedly dropping and recreating Core causes crashes
+fn test_drop_recreate(assets: &PathBuf) -> Result<()> {
+    eprintln!("\n=== Test 5: Drop/Recreate Core (20 cycles) ===");
+
+    for i in 1..=20 {
+        eprintln!("  Cycle {}: creating Core+Model...", i);
+        let model = load_model(assets)?;
+        eprintln!("  Cycle {}: dropping...", i);
+        drop(model);
+    }
+
+    eprintln!("  PASS");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let assets = PathBuf::from(std::env::args().nth(1).unwrap_or_else(|| "assets".into()));
     eprintln!("assets dir: {}", assets.display());
@@ -390,6 +405,19 @@ fn main() -> Result<()> {
 
     if only.as_deref() == Some("leak") || only.is_none() {
         match test_leak_detection(&mut model) {
+            Ok(()) => passed += 1,
+            Err(e) => {
+                eprintln!("  FAILED: {e}");
+                failed += 1;
+            }
+        }
+    }
+
+    // Drop the shared model before test 5
+    drop(model);
+
+    if only.as_deref() == Some("recreate") || only.is_none() {
+        match test_drop_recreate(&assets) {
             Ok(()) => passed += 1,
             Err(e) => {
                 eprintln!("  FAILED: {e}");
