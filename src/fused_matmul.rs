@@ -2,11 +2,13 @@
 //!
 //! Provides `MatMul`, a drop-in replacement for candle's `QMatMul` that uses
 //! column-tiled loops for better L1 cache behavior on x86.
+//! Pre-dequantized F32 weights use fbgemm-rs with pre-packed matrices.
 
 use candle_core::backend::BackendStorage;
 use candle_core::quantized::k_quants::*;
 use candle_core::quantized::{GgmlDType, GgmlType, QTensor};
 use candle_core::{CpuStorage, CustomOp1, DType, Layout, Module, Result, Shape, Tensor};
+use fbgemm_rs::PackedMatrix;
 use rayon::prelude::*;
 use std::sync::Arc;
 
@@ -250,14 +252,78 @@ impl CustomOp1 for QGatedMatMul {
     }
 }
 
+// ---- fbgemm-rs F32 matmul via pre-packed weights ----
+
+struct FbgemmOp(Arc<PackedMatrix>);
+
+impl CustomOp1 for FbgemmOp {
+    fn name(&self) -> &'static str {
+        "fbgemm-matmul"
+    }
+
+    fn cpu_fwd(
+        &self,
+        storage: &CpuStorage,
+        layout: &Layout,
+    ) -> Result<(CpuStorage, Shape)> {
+        if !layout.is_contiguous() {
+            candle_core::bail!("input tensor is not contiguous {layout:?}")
+        }
+        let src_shape = layout.shape();
+        let k = self.0.k();
+        let n = self.0.n();
+        if src_shape.rank() < 2 {
+            candle_core::bail!("input tensor has only one dimension {layout:?}")
+        }
+        let mut dst_shape = src_shape.dims().to_vec();
+        let last_k = dst_shape.pop().unwrap();
+        if last_k != k {
+            candle_core::bail!(
+                "input tensor {layout:?} incompatible with packed matrix ({k}x{n})"
+            )
+        }
+        dst_shape.push(n);
+        let dst_shape = Shape::from(dst_shape);
+        let m = dst_shape.elem_count() / n;
+
+        if storage.dtype() != DType::F32 {
+            candle_core::bail!("FbgemmOp only supports f32 input")
+        }
+        let slice = storage.as_slice::<f32>()?;
+        let slice = &slice[layout.start_offset()..layout.start_offset() + src_shape.elem_count()];
+        let mut dst_storage = vec![0f32; dst_shape.elem_count()];
+
+        fbgemm_rs::sgemm_simple_par(m, slice, &self.0, &mut dst_storage);
+
+        Ok((CpuStorage::F32(dst_storage), dst_shape))
+    }
+}
+
 // ---- MatMul: drop-in replacement for QMatMul ----
 
 /// Drop-in replacement for `candle_core::quantized::QMatMul` that uses
-/// column-tiled matmul for quantized weights on CPU.
-#[derive(Clone, Debug)]
+/// column-tiled matmul for quantized weights and fbgemm-rs for F32 weights.
 pub enum MatMul {
     QTensor(Arc<QTensor>),
-    Tensor(Tensor),
+    Packed(Arc<PackedMatrix>),
+}
+
+impl Clone for MatMul {
+    fn clone(&self) -> Self {
+        match self {
+            Self::QTensor(qt) => Self::QTensor(qt.clone()),
+            Self::Packed(p) => Self::Packed(p.clone()),
+        }
+    }
+}
+
+impl std::fmt::Debug for MatMul {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::QTensor(qt) => f.debug_tuple("QTensor").field(qt).finish(),
+            Self::Packed(p) => write!(f, "Packed({}x{})", p.k(), p.n()),
+        }
+    }
 }
 
 impl MatMul {
@@ -265,8 +331,16 @@ impl MatMul {
         Self::QTensor(qt)
     }
 
+    /// Pre-pack a dequantized [N, K] weight tensor into fbgemm-rs format.
     pub fn from_tensor(t: Tensor) -> Self {
-        Self::Tensor(t)
+        let (n, k) = t.dims2().expect("weight must be 2D for MatMul::from_tensor");
+        let data = t
+            .flatten_all()
+            .and_then(|t| t.to_vec1::<f32>())
+            .expect("weight to f32");
+        // Weight is [N, K] row-major = [K, N] column-major → from_transposed
+        let packed = PackedMatrix::from_transposed(k, n, &data);
+        Self::Packed(Arc::new(packed))
     }
 }
 
@@ -274,14 +348,7 @@ impl Module for MatMul {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
             Self::QTensor(t) => xs.apply_op1_no_bwd(&QTiledOp(t.clone())),
-            Self::Tensor(w) => {
-                let w = match *xs.dims() {
-                    [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
-                    [bsize, _, _] => w.broadcast_left(bsize)?.t()?,
-                    _ => w.t()?,
-                };
-                xs.matmul(&w)
-            }
+            Self::Packed(p) => xs.apply_op1_no_bwd(&FbgemmOp(p.clone())),
         }
     }
 }
