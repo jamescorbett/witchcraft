@@ -55,6 +55,9 @@ test: download
 	RUST_LOG=debug cargo llvm-cov nextest --release --features napi,t5-quantized,metal,accelerate --lcov --output-path lcov.info # --no-capture
 	genhtml lcov.info
 
+bench:
+	cargo run -p t5-bench --release --features hybrid-dequant,ov
+
 nfcorpus: download
 	cargo run --release --features metal,t5-quantized,progress  --bin warp-cli readcsv datasets/nfcorpus.tsv
 	cargo run --release --features metal,t5-quantized,progress --bin warp-cli embed
