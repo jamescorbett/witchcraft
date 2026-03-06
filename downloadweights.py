@@ -1,24 +1,39 @@
 import torch
 import torch.nn as nn
+from transformers import AutoModel
 from huggingface_hub import hf_hub_download, snapshot_download
 from safetensors.torch import save_file
+import zstandard as zstd
 import os
 
-from transformers import T5EncoderModel, T5PreTrainedModel, SinqConfig
-from sinq.sinqlinear_hf import SINQLinear
 
-# SINQ quantization replaces weight tensors with None; T5's _init_weights
-# then crashes trying to re-initialize them.  Patch to skip those modules.
-_original_init_weights = T5PreTrainedModel._init_weights
-def _patched_init_weights(self, module):
-    try:
-        _original_init_weights(self, module)
-    except AttributeError:
-        pass
-T5PreTrainedModel._init_weights = _patched_init_weights
+snapshot_download(repo_id="google/xtr-base-en", local_dir="xtr-base-en", local_dir_use_symlinks=False, revision="main")
 
-snapshot_download(repo_id="google/xtr-base-en", local_dir="xtr-base-en",
-                  local_dir_use_symlinks=False, revision="main")
+class ProgressReader:
+    def __init__(self, fileobj, label="", report_every_mb=1):
+        self.fileobj = fileobj
+        self.label = label
+        self.total_read = 0
+        self.report_every = report_every_mb * 1024 * 1024
+        self.next_report = self.report_every
+
+    def read(self, size=-1):
+        chunk = self.fileobj.read(size)
+        self.total_read += len(chunk)
+        if self.total_read >= self.next_report:
+            print(f"[{self.label}] Compressed {self.total_read / (1024*1024):.1f} MB...")
+            self.next_report += self.report_every
+        return chunk
+
+def compress_file(in_path: str, out_path: str, level: int = 19):
+    print("compressing", in_path, "->", out_path, "...")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    with open(in_path, "rb") as src_file:
+        reader = ProgressReader(src_file, label=os.path.basename(in_path))
+        cctx = zstd.ZstdCompressor(level=level)
+        with open(out_path, "wb") as dst_file:
+            cctx.copy_stream(reader, dst_file)
 
 def export_to_openvino(model, output_dir="openvino_model"):
     """Convert PyTorch model directly to OpenVINO IR (no ONNX intermediate)."""
@@ -30,10 +45,12 @@ def export_to_openvino(model, output_dir="openvino_model"):
     dummy_input = torch.randint(0, 32128, (1, 512), dtype=torch.long)
 
     print("Converting PyTorch model directly to OpenVINO IR...")
+    # Test forward pass to verify output shape
     with torch.no_grad():
         test_output = model(dummy_input)
         print(f"Model output shape: {test_output.shape} (expected: [1, 512, 128])")
 
+        # Direct PyTorch to OpenVINO conversion (no ONNX intermediate)
         ov_model = ov.convert_model(
             model,
             example_input=dummy_input,
@@ -52,56 +69,34 @@ def export_to_openvino(model, output_dir="openvino_model"):
     print(f"Saved OpenVINO model: {xml_path}")
     return xml_path, bin_path
 
-
 class XTR(nn.Module):
-    def __init__(self, quantization_config=None):
+    def __init__(self):
         super().__init__()
 
-        encoder_model = T5EncoderModel.from_pretrained(
-            "google/xtr-base-en",
-            quantization_config=quantization_config,
-            use_safetensors=True,
-        )
-        self.encoder = encoder_model.encoder
+        self.encoder = AutoModel.from_pretrained("google/xtr-base-en", use_safetensors=True).encoder
+        self.linear = torch.nn.Linear(768, 128, bias=False)
 
-        self.linear = nn.Linear(768, 128, bias=False)
-        to_dense_path = hf_hub_download(
-            repo_id="google/xtr-base-en",
-            filename="2_Dense/pytorch_model.bin",
-        )
-        state = torch.load(to_dense_path, map_location="cpu", weights_only=True)
-        self.linear.load_state_dict({"weight": state["linear.weight"]})
+        to_dense_path = hf_hub_download(repo_id="google/xtr-base-en", filename="2_Dense/pytorch_model.bin")
+        state = torch.load(to_dense_path)
+
+        other = {}
+        other["weight"] = state["linear.weight"]
+        self.linear.load_state_dict(other)
 
     def forward(self, input_ids):
+        # T5 encoder forward pass
         encoder_output = self.encoder(input_ids)
+        # Get last_hidden_state from encoder output
         hidden_states = encoder_output.last_hidden_state if hasattr(encoder_output, 'last_hidden_state') else encoder_output[0]
-        return self.linear(hidden_states)
+        # Apply final linear projection 768 -> 128
+        embeddings = self.linear(hidden_states)
+        return embeddings
 
+snapshot_download(repo_id="google/xtr-base-en", local_dir="xtr-base-en", local_dir_use_symlinks=False, revision="main")
 
-# Quantize with SINQ then dequantize back to FP16 — SINQ's value is the
-# optimized quantization grid, which survives the round-trip better than naive RTN
-sinq_cfg = SinqConfig(nbits=4, group_size=64, tiling_mode="1D", method="sinq")
-xtr = XTR(quantization_config=sinq_cfg)
-
-# Replace every SINQLinear with a standard nn.Linear holding the dequantized weight.
-# Keep weights in FP32 for inference/OpenVINO export; save FP16 to safetensors.
-for name, module in list(xtr.named_modules()):
-    if not isinstance(module, SINQLinear):
-        continue
-    w = module.dequantize().float()
-    replacement = nn.Linear(w.shape[1], w.shape[0], bias=module.bias is not None)
-    replacement.weight = nn.Parameter(w)
-    if module.bias is not None:
-        replacement.bias = nn.Parameter(module.bias.float())
-    parts = name.split(".")
-    parent = xtr
-    for p in parts[:-1]:
-        parent = getattr(parent, p)
-    setattr(parent, parts[-1], replacement)
-
+xtr = XTR()
 fp16_state_dict = {k: v.half().cpu() for k, v in xtr.state_dict().items()}
 save_file(fp16_state_dict, "xtr.safetensors")
-print(f"Saved xtr.safetensors with {len(fp16_state_dict)} tensors")
 
 import shutil
 shutil.copy("xtr-base-en/config.json", "assets/config.json")
@@ -113,12 +108,14 @@ try:
     print("OpenVINO FP32 base model export successful!")
     print("="*60)
 
+    # Get model size
     model_size = os.path.getsize(model_bin_path) / (1024 * 1024)
     print(f"FP32 base model size: {model_size:.2f} MB")
     print(f"Model files: {model_xml_path}, {model_bin_path}")
 
-    print("\nTo create INT4 quantized model (~66 MB), run:")
-    print("  python quantize-int4.py")
+    print("\nNOTE: This is the uncompressed FP32 base model.")
+    print("To create INT4 quantized model (~66 MB), run:")
+    print("  python quantize_int4.py")
     print("\n" + "="*60)
 
 except Exception as e:
