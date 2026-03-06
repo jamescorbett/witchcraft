@@ -3,6 +3,7 @@ torch
 transformers
 huggingface_hub
 safetensors
+accelerate
 openvino==2026.0.0
 pytrec_eval
 nncf
