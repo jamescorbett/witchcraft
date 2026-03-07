@@ -1,11 +1,11 @@
 rm -rf output.txt
 
-export RUN="cargo run --bin warp-cli --release --features accelerate,t5-quantized"
+export RUN="cargo run --bin warp-cli --release --features accelerate,t5-quantized,progress"
 
-#rm -f mydb.sql
-#$RUN readcsv datasets/nfcorpus.tsv
-#$RUN embed
-#$RUN index
+rm -f mydb.sqlite*
+$RUN readcsv datasets/nfcorpus.tsv
+$RUN embed
+$RUN index
 
 $RUN querycsv $HOME/src/xtr-warp/beir/nfcorpus/questions.test.tsv output.txt &&\
 
