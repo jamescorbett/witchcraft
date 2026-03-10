@@ -2,15 +2,16 @@
 //!
 //! Provides `MatMul`, a drop-in replacement for candle's `QMatMul` that uses
 //! column-tiled loops for better L1 cache behavior on x86.
-//! Pre-dequantized weights use fbgemm-rs F32 packed GEMM when available,
-//! otherwise plain candle matmul (Accelerate BLAS on macOS).
+//! Pre-dequantized weights use fbgemm-rs bf16 packed GEMM when available
+//! (halves weight memory, reduces cache pressure), otherwise plain candle
+//! matmul (Accelerate BLAS on macOS).
 
 use candle_core::backend::BackendStorage;
 use candle_core::quantized::k_quants::*;
 use candle_core::quantized::{GgmlDType, GgmlType, QTensor};
 use candle_core::{CpuStorage, CustomOp1, DType, Layout, Module, Result, Shape, Tensor};
 #[cfg(feature = "fbgemm")]
-use fbgemm_rs::PackedMatrix;
+use fbgemm_rs::PackedMatrixBf16;
 use rayon::prelude::*;
 use std::sync::Arc;
 
@@ -245,15 +246,15 @@ impl CustomOp1 for QGatedMatMul {
     }
 }
 
-// ---- fbgemm-rs F32 GEMM via pre-packed weights ----
+// ---- fbgemm-rs bf16 packed GEMM via pre-packed weights ----
 
 #[cfg(feature = "fbgemm")]
-struct FbgemmOp(Arc<PackedMatrix>);
+struct FbgemmBf16Op(Arc<PackedMatrixBf16>);
 
 #[cfg(feature = "fbgemm")]
-impl CustomOp1 for FbgemmOp {
+impl CustomOp1 for FbgemmBf16Op {
     fn name(&self) -> &'static str {
-        "fbgemm-matmul"
+        "fbgemm-bf16-matmul"
     }
 
     fn cpu_fwd(&self, storage: &CpuStorage, layout: &Layout) -> Result<(CpuStorage, Shape)> {
@@ -269,20 +270,20 @@ impl CustomOp1 for FbgemmOp {
         let mut dst_shape = src_shape.dims().to_vec();
         let last_k = dst_shape.pop().unwrap();
         if last_k != k {
-            candle_core::bail!("input tensor {layout:?} incompatible with packed matrix ({k}x{n})")
+            candle_core::bail!("input tensor {layout:?} incompatible with packed bf16 matrix ({k}x{n})")
         }
         dst_shape.push(n);
         let dst_shape = Shape::from(dst_shape);
         let m = dst_shape.elem_count() / n;
 
         if storage.dtype() != DType::F32 {
-            candle_core::bail!("FbgemmOp only supports f32 input")
+            candle_core::bail!("FbgemmBf16Op only supports f32 input")
         }
         let slice = storage.as_slice::<f32>()?;
         let slice = &slice[layout.start_offset()..layout.start_offset() + src_shape.elem_count()];
         let mut dst_storage = vec![0f32; dst_shape.elem_count()];
 
-        fbgemm_rs::sgemm_simple(m, slice, &self.0, &mut dst_storage);
+        fbgemm_rs::sgemm_bf16_simple(m, slice, &self.0, &mut dst_storage);
 
         Ok((CpuStorage::F32(dst_storage), dst_shape))
     }
@@ -296,7 +297,7 @@ impl CustomOp1 for FbgemmOp {
 pub enum MatMul {
     QTensor(Arc<QTensor>),
     #[cfg(feature = "fbgemm")]
-    Packed(Arc<PackedMatrix>),
+    PackedBf16(Arc<PackedMatrixBf16>),
     Tensor(Tensor),
 }
 
@@ -305,7 +306,7 @@ impl Clone for MatMul {
         match self {
             Self::QTensor(qt) => Self::QTensor(qt.clone()),
             #[cfg(feature = "fbgemm")]
-            Self::Packed(p) => Self::Packed(p.clone()),
+            Self::PackedBf16(p) => Self::PackedBf16(p.clone()),
             Self::Tensor(t) => Self::Tensor(t.clone()),
         }
     }
@@ -316,7 +317,7 @@ impl std::fmt::Debug for MatMul {
         match self {
             Self::QTensor(qt) => f.debug_tuple("QTensor").field(qt).finish(),
             #[cfg(feature = "fbgemm")]
-            Self::Packed(p) => write!(f, "Packed({}x{})", p.k(), p.n()),
+            Self::PackedBf16(p) => write!(f, "PackedBf16({}x{})", p.k(), p.n()),
             Self::Tensor(t) => write!(f, "Tensor({:?})", t.shape()),
         }
     }
@@ -327,8 +328,9 @@ impl MatMul {
         Self::QTensor(qt)
     }
 
-    /// Store a dequantized [N, K] weight tensor for F32 matmul.
-    /// Uses fbgemm-rs packed GEMM when available, otherwise plain candle matmul.
+    /// Store a dequantized [N, K] weight tensor as bf16-packed for GEMM.
+    /// Uses fbgemm-rs bf16 packed GEMM when available (halves weight memory),
+    /// otherwise plain candle matmul.
     pub fn from_tensor(t: Tensor) -> Self {
         #[cfg(feature = "fbgemm")]
         {
@@ -339,8 +341,8 @@ impl MatMul {
                 .flatten_all()
                 .and_then(|t| t.to_vec1::<f32>())
                 .expect("weight to f32");
-            let packed = PackedMatrix::from_transposed(k, n, &data);
-            Self::Packed(Arc::new(packed))
+            let packed = PackedMatrixBf16::from_transposed(k, n, &data);
+            Self::PackedBf16(Arc::new(packed))
         }
         #[cfg(not(feature = "fbgemm"))]
         {
@@ -354,7 +356,7 @@ impl Module for MatMul {
         match self {
             Self::QTensor(t) => xs.apply_op1_no_bwd(&QTiledOp(t.clone())),
             #[cfg(feature = "fbgemm")]
-            Self::Packed(p) => xs.apply_op1_no_bwd(&FbgemmOp(p.clone())),
+            Self::PackedBf16(p) => xs.apply_op1_no_bwd(&FbgemmBf16Op(p.clone())),
             Self::Tensor(w) => {
                 let w = match *xs.dims() {
                     [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
