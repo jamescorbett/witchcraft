@@ -195,8 +195,15 @@ static PROGRESSFN: OnceCell<Box<dyn Fn(ProgressEvent) + Send + Sync>> = OnceCell
 pub fn set_progress_callback(callback: Function<(ProgressEvent,), Unknown>) -> Result<()> {
     use napi::threadsafe_function::ThreadsafeFunctionCallMode;
 
-    // Safety: We're intentionally leaking the callback reference to make it 'static
-    // This is okay because we only set the callback once and it lives for the duration of the program
+    // SAFETY: This lifetime extension is safe because ThreadsafeFunction's build process
+    // creates a proper Node.js reference (via napi_create_threadsafe_function) that
+    // increments the JavaScript function's reference count and keeps it alive for the
+    // lifetime of the ThreadsafeFunction. The Node.js runtime guarantees the callback
+    // remains valid until the TSFN is explicitly released or the environment shuts down.
+    //
+    // The transmute is necessary because Rust's borrow checker cannot understand the
+    // FFI boundary where Node-API's reference counting takes over lifetime management.
+    // This pattern is documented in napi-rs for long-lived threadsafe functions.
     let callback_static: Function<'static, (ProgressEvent,), Unknown> =
         unsafe { std::mem::transmute(callback) };
 
