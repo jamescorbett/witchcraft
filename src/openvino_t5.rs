@@ -45,7 +45,7 @@ impl T5ModelBuilder {
                             std::env::set_var("PATH", new_path);
                         }
                         log::info!(
-                            "[INFO] Added assets directory to PATH for OpenVINO DLLs: {}",
+                            "Added assets directory to PATH for OpenVINO DLLs: {}",
                             assets_str
                         );
                     }
