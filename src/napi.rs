@@ -95,8 +95,15 @@ pub fn set_log_callback(
 ) -> Result<()> {
     use napi::threadsafe_function::ThreadsafeFunctionCallMode;
 
-    // Safety: We're intentionally leaking the callback reference to make it 'static
-    // This is okay because we only set the callback once and it lives for the duration of the program
+    // SAFETY: This lifetime extension is safe because ThreadsafeFunction's build process
+    // creates a proper Node.js reference (via napi_create_threadsafe_function) that
+    // increments the JavaScript function's reference count and keeps it alive for the
+    // lifetime of the ThreadsafeFunction. The Node.js runtime guarantees the callback
+    // remains valid until the TSFN is explicitly released or the environment shuts down.
+    //
+    // The transmute is necessary because Rust's borrow checker cannot understand the
+    // FFI boundary where Node-API's reference counting takes over lifetime management.
+    // This pattern is documented in napi-rs for long-lived threadsafe functions.
     let callback_static: Function<'static, (LogEvent,), Unknown> =
         unsafe { std::mem::transmute(callback) };
 
@@ -135,11 +142,18 @@ pub struct StatsEvent {
 static STATSFN: OnceCell<Box<dyn Fn(StatsEvent) + Send + Sync>> = OnceCell::new();
 
 #[napi]
-pub fn set_stats_callback(callback: Function<(LogEvent,), Unknown>) -> Result<()> {
+pub fn set_stats_callback(callback: Function<(StatsEvent,), Unknown>) -> Result<()> {
     use napi::threadsafe_function::ThreadsafeFunctionCallMode;
 
-    // Safety: We're intentionally leaking the callback reference to make it 'static
-    // This is okay because we only set the callback once and it lives for the duration of the program
+    // SAFETY: This lifetime extension is safe because ThreadsafeFunction's build process
+    // creates a proper Node.js reference (via napi_create_threadsafe_function) that
+    // increments the JavaScript function's reference count and keeps it alive for the
+    // lifetime of the ThreadsafeFunction. The Node.js runtime guarantees the callback
+    // remains valid until the TSFN is explicitly released or the environment shuts down.
+    //
+    // The transmute is necessary because Rust's borrow checker cannot understand the
+    // FFI boundary where Node-API's reference counting takes over lifetime management.
+    // This pattern is documented in napi-rs for long-lived threadsafe functions.
     let callback_static: Function<'static, (StatsEvent,), Unknown> =
         unsafe { std::mem::transmute(callback) };
 
