@@ -1550,7 +1550,7 @@ pub fn search(
     top_k: usize,
     use_fulltext: bool,
     sql_filter: Option<&SqlStatementInternal>,
-) -> Result<Vec<(f32, String, String, u32)>> {
+) -> Result<Vec<(f32, String, Vec<String>, u32)>> {
     let now = std::time::Instant::now();
 
     let q = q.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1615,29 +1615,25 @@ pub fn search(
             Some(score) => *score,
             None => 0.0f32,
         };
-        let (metadata, body) = body_query.query_row((idx,), |row| {
+        let (metadata, bodies) = body_query.query_row((idx,), |row| {
             let (metadata, body, lens) = (
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?
             );
-            info!("lens {lens}");
             let lens: Vec<usize> = lens
                 .split(',')
                 .map(|x| x.parse::<usize>().unwrap())
                 .collect();
-            let bodies = split_by_codepoints(&body, &lens);
-            info!("bodies {}", bodies.len());
-            let clamped = (sub_idx as usize).min(bodies.len().saturating_sub(1));
-            let body = bodies[clamped].to_string();
-            Ok((metadata, body))
+            let bodies: Vec<String> = split_by_codepoints(&body, &lens)
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect();
+            Ok((metadata, bodies))
         })?;
 
-        let body_idx = match offsets.get(&tuple) {
-            Some(offset) => *offset,
-            None => 0u32,
-        };
-        results.push((score, metadata, body, body_idx));
+        let sub = (sub_idx as usize).min(bodies.len().saturating_sub(1)) as u32;
+        results.push((score, metadata, bodies, sub));
     }
 
     let mut max = -1.0f32;

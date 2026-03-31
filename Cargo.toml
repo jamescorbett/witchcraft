@@ -47,7 +47,7 @@ safetensors = "0.6.2"
 uuid = {version = "1.18.1", features = ["v5"] }
 iso8601-timestamp = "0.3.3"
 log = "0.4.28"
-text-splitter = "0.28.0" # !Dash
+text-splitter = { version = "0.28.0", features = ["markdown"] } # !Dash
 regex = "1"                # !Dash
 chrono = "0.4"             # !Dash
 lz4_flex = "0.11.5"

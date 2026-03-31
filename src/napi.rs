@@ -560,7 +560,7 @@ pub struct SearchTask {
 }
 
 impl<'env> ScopedTask<'env> for SearchTask {
-    type Output = Vec<(f32, String, String, u32)>;
+    type Output = Vec<(f32, String, Vec<String>, u32)>;
     type JsValue = Object<'env>;
 
     fn compute(&mut self) -> Result<Self::Output> {
@@ -574,12 +574,14 @@ impl<'env> ScopedTask<'env> for SearchTask {
 
     fn resolve(&mut self, env: &'env Env, out: Self::Output) -> Result<Self::JsValue> {
         let mut outer: Array<'env> = env.create_array(out.len() as u32)?;
-        for (i, (score, metadata, body, idx)) in out.into_iter().enumerate() {
+        for (i, (score, metadata, bodies, idx)) in out.into_iter().enumerate() {
+            let idx = (idx as usize).min(bodies.len().saturating_sub(1));
+            let body = bodies.get(idx).cloned().unwrap_or_default();
             let mut obj = Object::new(env)?;
             obj.set("score", score as f64)?;
             obj.set("metadata", metadata)?;
             obj.set("body", body)?;
-            obj.set("idx", idx)?;
+            obj.set("idx", idx as u32)?;
             outer.set(i as u32, obj)?;
         }
         outer.coerce_to_object()

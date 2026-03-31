@@ -4,13 +4,14 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use text_splitter::TextSplitter;
+use text_splitter::{MarkdownSplitter, TextSplitter};
 use uuid::Uuid;
 
 use crate::DB;
 
 const MIN_CHUNK_CODEPOINTS: usize = 5;
 const MAX_CHUNK_CODEPOINTS: usize = 4000;
+const MD_SECTION_MAX: usize = 1500;
 
 // Stable UUID namespace for Claude Code sessions
 const CLAUDE_CODE_NAMESPACE: Uuid = Uuid::from_bytes([
@@ -45,6 +46,16 @@ struct ContentBlock {
     block_type: String,
     #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    input: Option<ToolInput>,
+}
+
+#[derive(Deserialize)]
+struct ToolInput {
+    #[serde(default)]
+    file_path: Option<String>,
 }
 
 struct Chunk {
@@ -334,9 +345,8 @@ fn ingest_memory_file(db: &mut DB, path: &Path, project_name: &str, mtime_ms: i6
     };
 
     let header = format!("[{project_name}] {}\n", filename.trim_end_matches(".md"));
-    let splitter = TextSplitter::new(500);
     let mut bodies = vec![header];
-    bodies.extend(splitter.chunks(&body_text).map(|c| format!("{c}\n")));
+    bodies.extend(split_markdown(&body_text));
     let lengths: Vec<usize> = bodies.iter().map(|b| b.chars().count()).collect();
     let body = bodies.join("");
 
@@ -365,6 +375,99 @@ fn file_mtime_ms(path: &Path) -> Option<i64> {
         .map(|d| d.as_millis() as i64)
 }
 
+fn extract_written_paths(path: &Path) -> Vec<PathBuf> {
+    let raw = match fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+
+    let mut paths = std::collections::HashSet::new();
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let entry: SessionEntry = match serde_json::from_str(line) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let msg = match &entry.message {
+            Some(m) => m,
+            None => continue,
+        };
+        let content = match &msg.content {
+            Some(c) => c,
+            None => continue,
+        };
+        if let Content::Blocks(blocks) = content {
+            for block in blocks {
+                if block.block_type == "tool_use"
+                    && block.name.as_deref() == Some("Write")
+                {
+                    if let Some(ref input) = block.input {
+                        if let Some(ref fp) = input.file_path {
+                            paths.insert(PathBuf::from(fp));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut sorted: Vec<PathBuf> = paths.into_iter().collect();
+    sorted.sort();
+    sorted
+}
+
+fn ingest_authored_file(db: &mut DB, path: &Path, project_name: &str, mtime_ms: i64) -> Result<bool> {
+    let raw = fs::read_to_string(path)?;
+    if raw.trim().is_empty() {
+        return Ok(false);
+    }
+
+    let path_str = path.to_string_lossy();
+    let uuid = Uuid::new_v5(
+        &CLAUDE_CODE_NAMESPACE,
+        format!("authored:{path_str}").as_bytes(),
+    );
+
+    // Strip YAML frontmatter (same as memory files)
+    let body_text = if raw.starts_with("---\n") {
+        if let Some(end) = raw[4..].find("\n---\n") {
+            raw[4 + end + 5..].to_string()
+        } else {
+            raw.clone()
+        }
+    } else {
+        raw.clone()
+    };
+
+    let filename = path.file_name().unwrap().to_string_lossy();
+    let header = format!("[{project_name}] {filename}\n");
+    let mut bodies = vec![header];
+    bodies.extend(split_markdown(&body_text));
+    let lengths: Vec<usize> = bodies.iter().map(|b| b.chars().count()).collect();
+    let body = bodies.join("");
+
+    if body.trim().is_empty() {
+        return Ok(false);
+    }
+
+    let metadata = serde_json::json!({
+        "project": project_name,
+        "path": path_str,
+        "mtime_ms": mtime_ms,
+    })
+    .to_string();
+
+    db.add_doc(&uuid, None, &metadata, &body, Some(lengths))?;
+    Ok(true)
+}
+
+fn split_markdown(text: &str) -> Vec<String> {
+    let splitter = MarkdownSplitter::new(MD_SECTION_MAX);
+    splitter.chunks(text).map(|c| c.to_string()).collect()
+}
+
 fn load_watermarks(db: &DB) -> HashMap<String, i64> {
     let mut watermarks = HashMap::new();
     let mut stmt = match db.query(
@@ -387,19 +490,20 @@ fn load_watermarks(db: &DB) -> HashMap<String, i64> {
     watermarks
 }
 
-pub fn ingest_claude_code(db: &mut DB) -> Result<(usize, usize)> {
+pub fn ingest_claude_code(db: &mut DB) -> Result<(usize, usize, usize)> {
     let home = std::env::var("HOME").unwrap_or_default();
     let projects_dir = PathBuf::from(&home).join(".claude/projects");
 
     if !projects_dir.is_dir() {
         println!("no Claude Code projects found at {}", projects_dir.display());
-        return Ok((0, 0));
+        return Ok((0, 0, 0));
     }
 
     let watermarks = load_watermarks(db);
 
     let mut session_count = 0usize;
     let mut memory_count = 0usize;
+    let mut authored_count = 0usize;
 
     let mut entries: Vec<_> = fs::read_dir(&projects_dir)?
         .filter_map(|e| e.ok())
@@ -415,7 +519,7 @@ pub fn ingest_claude_code(db: &mut DB) -> Result<(usize, usize)> {
         let dir_name = entry.file_name().to_string_lossy().to_string();
         let project_name = decode_project_name(&dir_name);
 
-        // Ingest .jsonl session files
+        // Ingest .jsonl session files, collecting authored file paths
         let mut jsonl_files: Vec<PathBuf> = fs::read_dir(&dir_path)?
             .filter_map(|e| e.ok())
             .map(|e| e.path())
@@ -423,18 +527,28 @@ pub fn ingest_claude_code(db: &mut DB) -> Result<(usize, usize)> {
             .collect();
         jsonl_files.sort();
 
+        let mut authored_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
         for jsonl_path in &jsonl_files {
             let path_str = jsonl_path.to_string_lossy().to_string();
             let mtime_ms = file_mtime_ms(jsonl_path).unwrap_or(0);
-            if let Some(&prev_ms) = watermarks.get(&path_str) {
-                if mtime_ms <= prev_ms {
-                    continue;
+            let changed = match watermarks.get(&path_str) {
+                Some(&prev_ms) => mtime_ms > prev_ms,
+                None => true,
+            };
+
+            if changed {
+                // Only scan changed sessions for authored files
+                for p in extract_written_paths(jsonl_path) {
+                    if p.extension().is_some_and(|ext| ext == "md") && p.is_file() {
+                        authored_paths.insert(p);
+                    }
                 }
-            }
-            match ingest_session(db, jsonl_path, &project_name, mtime_ms) {
-                Ok(n) => session_count += n,
-                Err(e) => {
-                    log::warn!("failed to ingest {}: {e}", jsonl_path.display());
+                match ingest_session(db, jsonl_path, &project_name, mtime_ms) {
+                    Ok(n) => session_count += n,
+                    Err(e) => {
+                        log::warn!("failed to ingest {}: {e}", jsonl_path.display());
+                    }
                 }
             }
         }
@@ -450,6 +564,9 @@ pub fn ingest_claude_code(db: &mut DB) -> Result<(usize, usize)> {
             md_files.sort();
 
             for md_path in &md_files {
+                // Don't also ingest memory files as authored
+                authored_paths.remove(md_path);
+
                 let path_str = md_path.to_string_lossy().to_string();
                 let mtime_ms = file_mtime_ms(md_path).unwrap_or(0);
                 if let Some(&prev_ms) = watermarks.get(&path_str) {
@@ -466,7 +583,76 @@ pub fn ingest_claude_code(db: &mut DB) -> Result<(usize, usize)> {
                 }
             }
         }
+
+        // Ingest authored .md files found in sessions
+        let mut authored_sorted: Vec<PathBuf> = authored_paths.into_iter().collect();
+        authored_sorted.sort();
+        for md_path in &authored_sorted {
+            let path_str = md_path.to_string_lossy().to_string();
+            let mtime_ms = file_mtime_ms(md_path).unwrap_or(0);
+            if let Some(&prev_ms) = watermarks.get(&path_str) {
+                if mtime_ms <= prev_ms {
+                    continue;
+                }
+            }
+            match ingest_authored_file(db, md_path, &project_name, mtime_ms) {
+                Ok(true) => authored_count += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    log::warn!("failed to ingest authored {}: {e}", md_path.display());
+                }
+            }
+        }
     }
 
-    Ok((session_count, memory_count))
+    Ok((session_count, memory_count, authored_count))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_split_markdown_no_bare_headings() {
+        let md = "\
+# Open Source Release Checklist
+
+## Blockers (must fix before release)
+
+- [ ] Add LICENSE file
+- [ ] Add fields to Cargo.toml
+
+## High priority (should fix)
+
+- [ ] Remove internal docs
+- [ ] Fix hardcoded paths
+
+## Verified clean (no action needed)
+
+- No secrets in tracked code";
+
+        let chunks = split_markdown(md);
+
+        // No chunk should be just a heading with no body
+        for chunk in &chunks {
+            let lines: Vec<&str> = chunk.trim().lines().collect();
+            assert!(
+                lines.len() > 1 || !lines[0].starts_with('#'),
+                "bare heading chunk: {chunk:?}"
+            );
+        }
+
+        // Every heading should appear somewhere
+        assert!(chunks.iter().any(|c| c.contains("# Open Source Release Checklist")));
+        assert!(chunks.iter().any(|c| c.contains("## Blockers")));
+        assert!(chunks.iter().any(|c| c.contains("## High priority")));
+        assert!(chunks.iter().any(|c| c.contains("## Verified clean")));
+
+        // Headings stay with their body content
+        let blockers = chunks.iter().find(|c| c.contains("## Blockers")).unwrap();
+        assert!(blockers.contains("Add LICENSE file"), "Blockers heading should include its list items");
+
+        let high = chunks.iter().find(|c| c.contains("## High priority")).unwrap();
+        assert!(high.contains("Remove internal docs"), "High priority heading should include its list items");
+    }
 }

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use log::{Level, LevelFilter, Metadata, Record};
 use std::env;
+use std::io::Write;
 use std::path::PathBuf;
 
 use warp::DB;
@@ -33,11 +34,11 @@ fn assets_path() -> PathBuf {
 
 fn update(db_name: &PathBuf, assets: &PathBuf) -> Result<bool> {
     let mut db = DB::new(db_name.clone()).unwrap();
-    let (sessions, memories) = warp::claude_code::ingest_claude_code(&mut db)?;
-    if sessions + memories == 0 {
+    let (sessions, memories, authored) = warp::claude_code::ingest_claude_code(&mut db)?;
+    if sessions + memories + authored == 0 {
         return Ok(false);
     }
-    println!("ingested {sessions} sessions, {memories} memory files");
+    println!("ingested {sessions} sessions, {memories} memory files, {authored} authored files");
 
     let device = warp::make_device();
     let embedder = warp::Embedder::new(&device, assets)?;
@@ -50,42 +51,125 @@ fn update(db_name: &PathBuf, assets: &PathBuf) -> Result<bool> {
     Ok(true)
 }
 
-// ANSI color helpers
-const BOLD: &str = "\x1b[1m";
-const DIM: &str = "\x1b[2m";
-const RESET: &str = "\x1b[0m";
-const CYAN: &str = "\x1b[36m";
-const GREEN: &str = "\x1b[32m";
-const MAGENTA: &str = "\x1b[35m";
+// ANSI color helpers — disabled when stdout is not a terminal
+struct Colors {
+    bold: &'static str,
+    dim: &'static str,
+    reset: &'static str,
+    cyan: &'static str,
+    green: &'static str,
+    yellow: &'static str,
+    magenta: &'static str,
+}
+
+fn colors() -> Colors {
+    use std::io::IsTerminal;
+    if std::io::stdout().is_terminal() {
+        Colors {
+            bold: "\x1b[1m",
+            dim: "\x1b[2m",
+            reset: "\x1b[0m",
+            cyan: "\x1b[36m",
+            green: "\x1b[32m",
+            yellow: "\x1b[33m",
+            magenta: "\x1b[35m",
+        }
+    } else {
+        Colors {
+            bold: "",
+            dim: "",
+            reset: "",
+            cyan: "",
+            green: "",
+            yellow: "",
+            magenta: "",
+        }
+    }
+}
 
 fn search(db_name: &PathBuf, assets: &PathBuf, q: &str) -> Result<()> {
+    let c = colors();
     let device = warp::make_device();
     let embedder = warp::Embedder::new(&device, assets)?;
     let mut cache = warp::EmbeddingsCache::new(1);
     let db = DB::new_reader(db_name.clone()).unwrap();
     let results = warp::search(&db, &embedder, &mut cache, q, 0.5, 10, true, None)?;
-    for (score, metadata, body, _body_idx) in &results {
+
+    // Render output to a buffer, then page if needed
+    let (_, cols) = terminal_size();
+    let separator: String = "─".repeat(cols);
+    let mut buf = Vec::new();
+    for (score, metadata, bodies, sub_idx) in &results {
+        writeln!(buf, "{}{separator}{}", c.dim, c.reset)?;
         let meta: serde_json::Value = serde_json::from_str(metadata).unwrap_or_default();
         let project = meta["project"].as_str().unwrap_or("");
         let session_id = meta["session_id"].as_str().unwrap_or("");
         let turn = meta["turn"].as_u64().unwrap_or(0);
         let path = meta["path"].as_str().unwrap_or("");
+        let idx = (*sub_idx as usize).min(bodies.len().saturating_sub(1));
 
-        println!("{BOLD}{GREEN}{score:.3}{RESET}  {CYAN}{project}{RESET}");
+        let filename = if path.ends_with(".md") {
+            format!("  {}{path}{}", c.yellow, c.reset)
+        } else {
+            String::new()
+        };
+        writeln!(buf, "{}{}{score:.3}{}  {}{project}{}{filename}", c.bold, c.green, c.reset, c.cyan, c.reset)?;
         if !session_id.is_empty() {
-            println!("  {MAGENTA}{session_id}{RESET} {DIM}turn {turn}{RESET}");
+            writeln!(buf, "  {}{session_id}{} {}turn {turn}{}", c.magenta, c.reset, c.dim, c.reset)?;
         }
-        if !path.is_empty() {
-            println!("  {DIM}{path}{RESET}");
+        if idx > 0 {
+            write_chunk(&mut buf, &bodies[idx - 1], "")?;
         }
-        let preview: String = body.chars().take(300).collect();
-        println!("  {preview}");
-        println!();
+        write_chunk(&mut buf, &bodies[idx], c.bold)?;
+        if idx + 1 < bodies.len() {
+            write_chunk(&mut buf, &bodies[idx + 1], "")?;
+        }
     }
     if results.is_empty() {
-        println!("no results");
+        writeln!(buf, "no results")?;
+    }
+
+    use std::io::IsTerminal;
+    let output = String::from_utf8(buf)?;
+    if std::io::stdout().is_terminal() {
+        let (term_lines, _) = terminal_size();
+        let output_lines = output.lines().count();
+        if output_lines + 2 > term_lines {
+            use std::process::{Command, Stdio};
+            let mut pager = Command::new("less")
+                .args(["-RFX"])
+                .stdin(Stdio::piped())
+                .spawn()?;
+            pager.stdin.take().unwrap().write_all(output.as_bytes())?;
+            let _ = pager.wait();
+            return Ok(());
+        }
+    }
+    print!("{output}");
+    Ok(())
+}
+
+fn write_chunk(buf: &mut Vec<u8>, text: &str, style: &str) -> std::io::Result<()> {
+    let reset = if style.is_empty() { "" } else { "\x1b[0m" };
+    for line in text.lines().filter(|l| !l.is_empty()) {
+        writeln!(buf, "  {style}{line}{reset}")?;
     }
     Ok(())
+}
+
+fn terminal_size() -> (usize, usize) {
+    #[repr(C)]
+    struct Winsize { ws_row: u16, ws_col: u16, _xpixel: u16, _ypixel: u16 }
+    extern "C" { fn ioctl(fd: i32, request: u64, ...) -> i32; }
+    const TIOCGWINSZ: u64 = 0x40087468;
+    unsafe {
+        let mut ws = std::mem::zeroed::<Winsize>();
+        if ioctl(1, TIOCGWINSZ, &mut ws) == 0 && ws.ws_row > 0 && ws.ws_col > 0 {
+            (ws.ws_row as usize, ws.ws_col as usize)
+        } else {
+            (24, 80)
+        }
+    }
 }
 
 fn main() -> Result<()> {
