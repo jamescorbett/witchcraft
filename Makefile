@@ -66,8 +66,8 @@ warp-cli: download
 	ln -sf target/$(TARGET)/release/warp-cli ./warp-cli
 
 pickbrain: download
-	cargo build --release $(BUILD_TARGET) --features $(CLI_FEATURES) --bin pickbrain
-	ln -sf target/$(TARGET)/release/pickbrain ./pickbrain
+	cargo build --release $(BUILD_TARGET) --features $(CLI_FEATURES) --example pickbrain
+	ln -sf target/$(TARGET)/release/examples/pickbrain ./pickbrain
 
 macintel:
 	RUSTFLAGS='-C target-cpu=haswell' cargo build --release --target x86_64-apple-darwin --features t5-quantized,fbgemm,hybrid-dequant,progress
