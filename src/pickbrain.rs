@@ -45,7 +45,7 @@ fn update(db_name: &PathBuf, assets: &PathBuf) -> Result<bool> {
     let embedded = warp::embed_chunks(&db, &embedder, None)?;
     if embedded > 0 {
         println!("embedded {embedded} chunks");
-        warp::full_index(&db, &device)?;
+        warp::index_chunks(&db, &device)?;
         println!("index rebuilt");
     }
     Ok(true)
