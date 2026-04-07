@@ -52,52 +52,28 @@ fn embed_and_index(db: &DB, embedder: &Embedder, device: &candle_core::Device) -
     Ok(())
 }
 
-// ANSI color helpers — disabled when stdout is not a terminal
-struct Colors {
-    bold: &'static str,
-    dim: &'static str,
-    reset: &'static str,
-    cyan: &'static str,
-    green: &'static str,
-    bright_green: &'static str,
-    yellow: &'static str,
-    magenta: &'static str,
+// --- Search result data ---
+
+struct SearchResult {
+    timestamp: String,
+    project: String,
+    session_id: String,
+    turn: u64,
+    path: String,
+    bodies: Vec<String>,
+    match_idx: usize,
 }
 
-fn colors() -> Colors {
-    use std::io::IsTerminal;
-    if std::io::stdout().is_terminal() {
-        Colors {
-            bold: "\x1b[1m",
-            dim: "\x1b[2m",
-            reset: "\x1b[0m",
-            cyan: "\x1b[36m",
-            green: "\x1b[32m",
-            bright_green: "\x1b[38;2;0;255;0m",
-            yellow: "\x1b[33m",
-            magenta: "\x1b[35m",
-        }
-    } else {
-        Colors {
-            bold: "",
-            dim: "",
-            reset: "",
-            cyan: "",
-            green: "",
-            bright_green: "",
-            yellow: "",
-            magenta: "",
-        }
-    }
-}
-
-fn search(db_name: &PathBuf, assets: &PathBuf, q: &str, session: Option<&str>) -> Result<()> {
+fn run_search(
+    db_name: &PathBuf,
+    assets: &PathBuf,
+    q: &str,
+    session: Option<&str>,
+) -> Result<(Vec<SearchResult>, u128)> {
     use warp::types::*;
-    let c = colors();
     let device = warp::make_device();
     let embedder = warp::Embedder::new(&device, assets)?;
 
-    // Embed any pending chunks using the already-loaded model
     {
         let db_rw = DB::new(db_name.clone()).unwrap();
         embed_and_index(&db_rw, &embedder, &device)?;
@@ -128,73 +104,295 @@ fn search(db_name: &PathBuf, assets: &PathBuf, q: &str, session: Option<&str>) -
     )?;
     let search_ms = now.elapsed().as_millis();
 
-    // Render output to a buffer, then page if needed
-    let (_, cols) = terminal_size();
-    let separator: String = "─".repeat(cols);
-    let mut buf = Vec::new();
-    writeln!(buf, "\n{}{}[[ {q} ]]{}", c.bold, c.bright_green, c.reset)?;
-    writeln!(buf, "{}search completed in {search_ms} ms{}\n", c.dim, c.reset)?;
-    for (_score, metadata, bodies, sub_idx, date) in &results {
-        writeln!(buf, "{}{separator}{}", c.dim, c.reset)?;
-        let meta: serde_json::Value = serde_json::from_str(metadata).unwrap_or_default();
-        let project = meta["project"].as_str().unwrap_or("");
-        let session_id = meta["session_id"].as_str().unwrap_or("");
-        let turn = meta["turn"].as_u64().unwrap_or(0);
-        let path = meta["path"].as_str().unwrap_or("");
-        let idx = (*sub_idx as usize).min(bodies.len().saturating_sub(1));
+    let out: Vec<SearchResult> = results
+        .into_iter()
+        .map(|(_score, metadata, bodies, sub_idx, date)| {
+            let meta: serde_json::Value = serde_json::from_str(&metadata).unwrap_or_default();
+            let idx = (sub_idx as usize).min(bodies.len().saturating_sub(1));
+            SearchResult {
+                timestamp: format_date(&date),
+                project: meta["project"].as_str().unwrap_or("").to_string(),
+                session_id: meta["session_id"].as_str().unwrap_or("").to_string(),
+                turn: meta["turn"].as_u64().unwrap_or(0),
+                path: meta["path"].as_str().unwrap_or("").to_string(),
+                bodies,
+                match_idx: idx,
+            }
+        })
+        .collect();
+    Ok((out, search_ms))
+}
 
-        let timestamp = format_date(date);
-        let filename = if path.ends_with(".md") {
-            format!("  {}{path}{}", c.yellow, c.reset)
+// --- TUI ---
+
+enum View {
+    List,
+    Detail(usize),
+}
+
+fn search_tui(
+    db_name: &PathBuf,
+    assets: &PathBuf,
+    q: &str,
+    session: Option<&str>,
+) -> Result<()> {
+    let (results, search_ms) = run_search(db_name, assets, q, session)?;
+    if results.is_empty() {
+        eprintln!("no results");
+        return Ok(());
+    }
+
+    use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+    use crossterm::terminal::{
+        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    };
+    use ratatui::backend::CrosstermBackend;
+    use ratatui::layout::{Constraint, Direction, Layout};
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::{Line, Span};
+    use ratatui::widgets::{ListState, Paragraph, Wrap};
+    use ratatui::Terminal;
+
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    crossterm::execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut view = View::List;
+    let mut selected: usize = 0;
+    let mut list_state = ListState::default();
+    list_state.select(Some(0));
+    let mut scroll_offset: u16 = 0;
+
+    loop {
+        terminal.draw(|f| {
+            let area = f.area();
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(2), Constraint::Min(0)])
+                .split(area);
+
+            // Header
+            let header = Paragraph::new(Line::from(vec![
+                Span::styled(
+                    format!("[[ {q} ]]"),
+                    Style::default()
+                        .fg(Color::Rgb(0, 255, 0))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {search_ms} ms  "),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    match view {
+                        View::List => "↑↓ navigate  ⏎ open  q quit".to_string(),
+                        View::Detail(_) => "↑↓ scroll  esc back  q quit".to_string(),
+                    },
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+            f.render_widget(header, chunks[0]);
+
+            match view {
+                View::List => {
+                    let width = chunks[1].width as usize;
+                    let items: Vec<ratatui::widgets::ListItem> = results
+                        .iter()
+                        .map(|r| {
+                            let preview = first_line(&r.bodies[r.match_idx]);
+                            let mut meta_spans = vec![
+                                Span::styled(
+                                    format!("{} ", r.timestamp),
+                                    Style::default().fg(Color::Green),
+                                ),
+                                Span::styled(&r.project, Style::default().fg(Color::Cyan)),
+                            ];
+                            if r.path.ends_with(".md") {
+                                meta_spans.push(Span::styled(
+                                    format!("  {}", r.path),
+                                    Style::default().fg(Color::Yellow),
+                                ));
+                            }
+                            if !r.session_id.is_empty() {
+                                meta_spans.push(Span::styled(
+                                    format!("  turn {}", r.turn),
+                                    Style::default().fg(Color::DarkGray),
+                                ));
+                            }
+                            ratatui::widgets::ListItem::new(vec![
+                                Line::from(meta_spans),
+                                Line::styled(
+                                    format!("  {}", truncate(&preview, width.saturating_sub(4))),
+                                    Style::default(),
+                                ),
+                                Line::from(""),
+                            ])
+                        })
+                        .collect();
+
+                    let list = ratatui::widgets::List::new(items).highlight_style(
+                        Style::default()
+                            .bg(Color::DarkGray)
+                            .add_modifier(Modifier::BOLD),
+                    );
+                    f.render_stateful_widget(list, chunks[1], &mut list_state);
+                }
+                View::Detail(idx) => {
+                    let r = &results[idx];
+                    let mut lines: Vec<Line> = Vec::new();
+
+                    // Session header
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("{} ", r.timestamp),
+                            Style::default().fg(Color::Green),
+                        ),
+                        Span::styled(&r.project, Style::default().fg(Color::Cyan)),
+                    ]));
+                    if !r.session_id.is_empty() {
+                        lines.push(Line::from(vec![
+                            Span::styled(&r.session_id, Style::default().fg(Color::Magenta)),
+                            Span::styled(
+                                format!("  turn {}", r.turn),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                        ]));
+                    }
+                    lines.push(Line::from(""));
+
+                    for (i, chunk) in r.bodies.iter().enumerate() {
+                        let style = if i == r.match_idx {
+                            Style::default().add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        };
+                        for line in chunk.lines().filter(|l| !l.is_empty()) {
+                            lines.push(Line::styled(format!("  {line}"), style));
+                        }
+                        lines.push(Line::from(""));
+                    }
+
+                    let detail = Paragraph::new(lines)
+                        .wrap(Wrap { trim: false })
+                        .scroll((scroll_offset, 0));
+                    f.render_widget(detail, chunks[1]);
+                }
+            }
+        })?;
+
+        if let Event::Key(key) = event::read()? {
+            match (&view, key.code, key.modifiers) {
+                (_, KeyCode::Char('q'), _) => break,
+                (_, KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
+
+                // List view
+                (View::List, KeyCode::Down | KeyCode::Char('j'), _) => {
+                    if selected + 1 < results.len() {
+                        selected += 1;
+                        list_state.select(Some(selected));
+                    }
+                }
+                (View::List, KeyCode::Up | KeyCode::Char('k'), _) => {
+                    if selected > 0 {
+                        selected -= 1;
+                        list_state.select(Some(selected));
+                    }
+                }
+                (View::List, KeyCode::Enter, _) => {
+                    scroll_offset = 0;
+                    view = View::Detail(selected);
+                }
+
+                // Detail view
+                (View::Detail(_), KeyCode::Esc, _) => {
+                    view = View::List;
+                }
+                (View::Detail(_), KeyCode::Down | KeyCode::Char('j'), _) => {
+                    scroll_offset = scroll_offset.saturating_add(1);
+                }
+                (View::Detail(_), KeyCode::Up | KeyCode::Char('k'), _) => {
+                    scroll_offset = scroll_offset.saturating_sub(1);
+                }
+                (View::Detail(_), KeyCode::PageDown | KeyCode::Char(' '), _) => {
+                    scroll_offset = scroll_offset.saturating_add(20);
+                }
+                (View::Detail(_), KeyCode::PageUp, _) => {
+                    scroll_offset = scroll_offset.saturating_sub(20);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    disable_raw_mode()?;
+    crossterm::execute!(std::io::stdout(), LeaveAlternateScreen)?;
+    Ok(())
+}
+
+fn first_line(text: &str) -> String {
+    text.lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max.saturating_sub(3)])
+    }
+}
+
+// --- Plain text fallback (piped output) ---
+
+fn search_plain(
+    db_name: &PathBuf,
+    assets: &PathBuf,
+    q: &str,
+    session: Option<&str>,
+) -> Result<()> {
+    let (results, search_ms) = run_search(db_name, assets, q, session)?;
+
+    let mut buf = Vec::new();
+    writeln!(buf, "\n[[ {q} ]]")?;
+    writeln!(buf, "search completed in {search_ms} ms\n")?;
+    for r in &results {
+        writeln!(buf, "---")?;
+        let filename = if r.path.ends_with(".md") {
+            format!("  {}", r.path)
         } else {
             String::new()
         };
-        writeln!(
-            buf,
-            "{}{timestamp}{}  {}{project}{}{filename}",
-            c.green, c.reset, c.cyan, c.reset
-        )?;
-        if !session_id.is_empty() {
-            writeln!(
-                buf,
-                "  {}{session_id}{} {}turn {turn}{}",
-                c.magenta, c.reset, c.dim, c.reset
-            )?;
+        writeln!(buf, "{}  {}{filename}", r.timestamp, r.project)?;
+        if !r.session_id.is_empty() {
+            writeln!(buf, "  {} turn {}", r.session_id, r.turn)?;
         }
+        let idx = r.match_idx;
         if idx > 0 {
-            write_chunk(&mut buf, &bodies[idx - 1], "")?;
+            for line in r.bodies[idx - 1].lines().filter(|l| !l.is_empty()) {
+                writeln!(buf, "  {line}")?;
+            }
         }
-        write_chunk(&mut buf, &bodies[idx], c.bold)?;
-        if idx + 1 < bodies.len() {
-            write_chunk(&mut buf, &bodies[idx + 1], "")?;
+        for line in r.bodies[idx].lines().filter(|l| !l.is_empty()) {
+            writeln!(buf, "  {line}")?;
+        }
+        if idx + 1 < r.bodies.len() {
+            for line in r.bodies[idx + 1].lines().filter(|l| !l.is_empty()) {
+                writeln!(buf, "  {line}")?;
+            }
         }
     }
     if results.is_empty() {
         writeln!(buf, "no results")?;
     }
-
-    use std::io::IsTerminal;
-    let output = String::from_utf8(buf)?;
-    if std::io::stdout().is_terminal() {
-        let (term_lines, _) = terminal_size();
-        let output_lines = output.lines().count();
-        if output_lines + 2 > term_lines {
-            use std::process::{Command, Stdio};
-            let mut pager = Command::new("less")
-                .args(["-RFX"])
-                .stdin(Stdio::piped())
-                .spawn()?;
-            pager.stdin.take().unwrap().write_all(output.as_bytes())?;
-            let _ = pager.wait();
-            return Ok(());
-        }
-    }
-    print!("{output}");
+    std::io::stdout().write_all(&buf)?;
     Ok(())
 }
 
 fn format_date(iso: &str) -> String {
-    // "2026-03-31T09:24:20.675Z" -> "Mar 31 09:24"
     let month = match iso.get(5..7) {
         Some("01") => "Jan",
         Some("02") => "Feb",
@@ -215,14 +413,6 @@ fn format_date(iso: &str) -> String {
     format!("{month} {day} {time}")
 }
 
-fn write_chunk(buf: &mut Vec<u8>, text: &str, style: &str) -> std::io::Result<()> {
-    let reset = if style.is_empty() { "" } else { "\x1b[0m" };
-    for line in text.lines().filter(|l| !l.is_empty()) {
-        writeln!(buf, "  {style}{line}{reset}")?;
-    }
-    Ok(())
-}
-
 fn parse_range(s: &str) -> (usize, usize) {
     if let Some((a, b)) = s.split_once('-') {
         let start = a.parse().unwrap_or(0);
@@ -235,10 +425,7 @@ fn parse_range(s: &str) -> (usize, usize) {
 }
 
 fn dump(db_name: &PathBuf, session_id: &str, turns_range: Option<&str>) -> Result<()> {
-    let c = colors();
     let db = DB::new_reader(db_name.clone()).unwrap();
-    let (_, cols) = terminal_size();
-    let separator: String = "─".repeat(cols);
 
     let (turn_start, turn_end) = turns_range.map(parse_range).unwrap_or((0, usize::MAX));
 
@@ -266,17 +453,8 @@ fn dump(db_name: &PathBuf, session_id: &str, turns_range: Option<&str>) -> Resul
         if t < turn_start || t > turn_end {
             continue;
         }
-        writeln!(buf, "{}{separator}{}", c.dim, c.reset)?;
-        writeln!(
-            buf,
-            "{}turn {t}{}  {}{}{}",
-            c.bold,
-            c.reset,
-            c.green,
-            format_date(date),
-            c.reset
-        )?;
-        // Skip the header chunk (first line is [project] title)
+        writeln!(buf, "---")?;
+        writeln!(buf, "turn {t}  {}", format_date(date))?;
         for line in body.lines().skip_while(|l| {
             l.starts_with('[') && !l.starts_with("[User]") && !l.starts_with("[Claude]")
         }) {
@@ -284,49 +462,23 @@ fn dump(db_name: &PathBuf, session_id: &str, turns_range: Option<&str>) -> Resul
         }
     }
     if !buf.is_empty() {
-        writeln!(buf, "{}{separator}{}", c.dim, c.reset)?;
+        writeln!(buf, "---")?;
     }
 
     use std::io::IsTerminal;
     let output = String::from_utf8(buf)?;
     if std::io::stdout().is_terminal() {
-        let (term_lines, _) = terminal_size();
-        let output_lines = output.lines().count();
-        if output_lines + 2 > term_lines {
-            use std::process::{Command, Stdio};
-            let mut pager = Command::new("less")
-                .args(["-RFX"])
-                .stdin(Stdio::piped())
-                .spawn()?;
-            pager.stdin.take().unwrap().write_all(output.as_bytes())?;
-            let _ = pager.wait();
-            return Ok(());
-        }
+        use std::process::{Command, Stdio};
+        let mut pager = Command::new("less")
+            .args(["-RFX"])
+            .stdin(Stdio::piped())
+            .spawn()?;
+        pager.stdin.take().unwrap().write_all(output.as_bytes())?;
+        let _ = pager.wait();
+    } else {
+        print!("{output}");
     }
-    print!("{output}");
     Ok(())
-}
-
-fn terminal_size() -> (usize, usize) {
-    #[repr(C)]
-    struct Winsize {
-        ws_row: u16,
-        ws_col: u16,
-        _xpixel: u16,
-        _ypixel: u16,
-    }
-    extern "C" {
-        fn ioctl(fd: i32, request: u64, ...) -> i32;
-    }
-    const TIOCGWINSZ: u64 = 0x40087468;
-    unsafe {
-        let mut ws = std::mem::zeroed::<Winsize>();
-        if ioctl(1, TIOCGWINSZ, &mut ws) == 0 && ws.ws_row > 0 && ws.ws_col > 0 {
-            (ws.ws_row as usize, ws.ws_col as usize)
-        } else {
-            (24, 80)
-        }
-    }
 }
 
 fn main() -> Result<()> {
@@ -371,7 +523,6 @@ fn main() -> Result<()> {
                 }
             }
             Ok(true) => {
-                // --update without query: do a full embed+index pass now
                 if do_update && !has_query {
                     let device = warp::make_device();
                     let embedder = Embedder::new(&device, &assets)?;
@@ -393,7 +544,12 @@ fn main() -> Result<()> {
         dump(&db_name, sid, turns_range.as_deref())?;
     } else if has_query {
         let q = query_args.join(" ");
-        search(&db_name, &assets, &q, session_filter.as_deref())?;
+        use std::io::IsTerminal;
+        if std::io::stdout().is_terminal() {
+            search_tui(&db_name, &assets, &q, session_filter.as_deref())?;
+        } else {
+            search_plain(&db_name, &assets, &q, session_filter.as_deref())?;
+        }
     } else if !do_update {
         eprintln!("Usage: pickbrain [--update] [--session UUID] <query>");
         eprintln!("       pickbrain --dump <UUID> [--turns N-M]");
