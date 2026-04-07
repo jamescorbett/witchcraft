@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 mod claude_code;
+mod codex;
 
 use witchcraft::{DB, Embedder};
 
@@ -37,10 +38,14 @@ fn assets_path() -> PathBuf {
 fn ingest(db_name: &PathBuf) -> Result<bool> {
     let mut db = DB::new(db_name.clone()).unwrap();
     let (sessions, memories, authored) = claude_code::ingest_claude_code(&mut db)?;
-    if sessions + memories + authored == 0 {
+    let codex_sessions = codex::ingest_codex(&mut db)?;
+    let total = sessions + memories + authored + codex_sessions;
+    if total == 0 {
         return Ok(false);
     }
-    eprintln!("ingested {sessions} sessions, {memories} memory files, {authored} authored files");
+    eprintln!(
+        "ingested {sessions} claude sessions, {codex_sessions} codex sessions, {memories} memory files, {authored} authored files"
+    );
     Ok(true)
 }
 
@@ -62,6 +67,8 @@ struct SearchResult {
     session_id: String,
     turn: u64,
     path: String,
+    cwd: String,
+    source: String,
     bodies: Vec<String>,
     match_idx: usize,
 }
@@ -73,7 +80,14 @@ struct SessionTurn {
     timestamp: String,
 }
 
-fn load_session_turns(jsonl_path: &str) -> Vec<SessionTurn> {
+fn load_session_turns(jsonl_path: &str, source: &str) -> Vec<SessionTurn> {
+    if source == "codex" {
+        return load_codex_session_turns(jsonl_path);
+    }
+    load_claude_session_turns(jsonl_path)
+}
+
+fn load_claude_session_turns(jsonl_path: &str) -> Vec<SessionTurn> {
     let raw = match std::fs::read_to_string(jsonl_path) {
         Ok(s) => s,
         Err(_) => return vec![],
@@ -139,7 +153,6 @@ fn load_session_turns(jsonl_path: &str) -> Vec<SessionTurn> {
             }
             None => continue,
         };
-        // Skip command/system messages
         let trimmed = text.trim();
         if trimmed.is_empty()
             || trimmed.starts_with("<command-")
@@ -147,7 +160,6 @@ fn load_session_turns(jsonl_path: &str) -> Vec<SessionTurn> {
         {
             continue;
         }
-        // Strip XML tags from the text
         let clean = regex::Regex::new(r"<[^>]+>")
             .map(|re| re.replace_all(&text, "").to_string())
             .unwrap_or(text);
@@ -160,6 +172,69 @@ fn load_session_turns(jsonl_path: &str) -> Vec<SessionTurn> {
             text: clean,
             timestamp: entry.timestamp.unwrap_or_default(),
         });
+    }
+    turns
+}
+
+fn load_codex_session_turns(jsonl_path: &str) -> Vec<SessionTurn> {
+    let raw = match std::fs::read_to_string(jsonl_path) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+
+    let re_xml = regex::Regex::new(r"<[^>]+>").unwrap();
+    let mut turns = Vec::new();
+
+    for line in raw.lines() {
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let timestamp = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or_default().to_string();
+        let entry_type = v.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+        let payload = match v.get("payload") {
+            Some(p) => p,
+            None => continue,
+        };
+
+        if entry_type == "response_item" {
+            let ptype = payload.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+            if ptype == "message" && payload.get("role").and_then(|r| r.as_str()) == Some("user") {
+                let content = match payload.get("content").and_then(|c| c.as_array()) {
+                    Some(c) => c,
+                    None => continue,
+                };
+                let text: String = content
+                    .iter()
+                    .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("input_text"))
+                    .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let clean = re_xml.replace_all(&text, "").trim().to_string();
+                if clean.is_empty() {
+                    continue;
+                }
+                turns.push(SessionTurn {
+                    role: "user".to_string(),
+                    text: clean,
+                    timestamp,
+                });
+            }
+        } else if entry_type == "event_msg" {
+            let ptype = payload.get("type").and_then(|t| t.as_str()).unwrap_or_default();
+            if ptype == "agent_reasoning" {
+                if let Some(text) = payload.get("text").and_then(|t| t.as_str()) {
+                    let clean = text.trim().to_string();
+                    if !clean.is_empty() {
+                        turns.push(SessionTurn {
+                            role: "assistant".to_string(),
+                            text: clean,
+                            timestamp,
+                        });
+                    }
+                }
+            }
+        }
     }
     turns
 }
@@ -215,6 +290,8 @@ fn run_search(
                 session_id: meta["session_id"].as_str().unwrap_or("").to_string(),
                 turn: meta["turn"].as_u64().unwrap_or(0),
                 path: meta["path"].as_str().unwrap_or("").to_string(),
+                cwd: meta["cwd"].as_str().unwrap_or("").to_string(),
+                source: meta["source"].as_str().unwrap_or("claude").to_string(),
                 bodies,
                 match_idx: idx,
             }
@@ -235,7 +312,7 @@ fn search_tui(
     assets: &PathBuf,
     q: &str,
     session: Option<&str>,
-) -> Result<Option<(String, String)>> {
+) -> Result<Option<(String, String, String)>> {
     let (results, search_ms) = run_search(db_name, assets, q, session)?;
     if results.is_empty() {
         eprintln!("no results");
@@ -264,8 +341,8 @@ fn search_tui(
     let mut list_state = ListState::default();
     list_state.select(Some(0));
     let mut scroll_offset: u16 = 0;
-    let mut resume_session: Option<(String, String)> = None;
-    let mut confirm_resume: Option<(String, String, String)> = None;
+    let mut resume_session: Option<(String, String, String)> = None;
+    let mut confirm_resume: Option<(String, String, String, String)> = None;
     // Cache loaded session turns so we don't re-read the JSONL on every frame
     let mut detail_cache: Option<(usize, Vec<SessionTurn>)> = None;
 
@@ -310,14 +387,17 @@ fn search_tui(
             // Footer: resume confirmation
             if show_footer {
                 let cwd = confirm_resume.as_ref()
-                    .map(|(_, _, c)| c.as_str())
+                    .map(|(_, _, c, _)| c.as_str())
                     .unwrap_or("?");
                 let sid = confirm_resume.as_ref()
-                    .map(|(s, _, _)| s.as_str())
+                    .map(|(s, _, _, _)| s.as_str())
                     .unwrap_or("?");
+                let src = confirm_resume.as_ref()
+                    .map(|(_, _, _, s)| s.as_str())
+                    .unwrap_or("claude");
                 let footer = Paragraph::new(Line::from(vec![
                     Span::styled(
-                        format!(" Exit pickbrain and resume session {sid} in {cwd}? "),
+                        format!(" Exit pickbrain and resume {src} session {sid} in {cwd}? "),
                         Style::default()
                             .fg(Color::Yellow)
                             .add_modifier(Modifier::BOLD),
@@ -417,7 +497,13 @@ fn search_tui(
                             let is_matched_turn = i == r.turn as usize;
                             lines.push(Line::from(vec![
                                 Span::styled(
-                                    if turn.role == "user" { "[User] " } else { "[Claude] " },
+                                    if turn.role == "user" {
+                                        "[User] "
+                                    } else if r.source == "codex" {
+                                        "[Codex] "
+                                    } else {
+                                        "[Claude] "
+                                    },
                                     role_style,
                                 ),
                                 Span::styled(
@@ -503,7 +589,7 @@ fn search_tui(
                 (View::List, KeyCode::Enter, _) => {
                     let r = &results[selected];
                     if !r.session_id.is_empty() && !r.path.is_empty() {
-                        let turns = load_session_turns(&r.path);
+                        let turns = load_session_turns(&r.path, &r.source);
                         // Scroll to the matched turn
                         let target = r.turn as usize;
                         let mut line_count: u16 = 3; // session header lines
@@ -540,14 +626,18 @@ fn search_tui(
                 (View::Detail(idx), KeyCode::Char('r'), _) => {
                     let r = &results[*idx];
                     if !r.session_id.is_empty() {
-                        let cwd = read_cwd_from_jsonl(&r.path)
-                            .unwrap_or_else(|| "?".to_string());
-                        confirm_resume = Some((r.session_id.clone(), r.path.clone(), cwd));
+                        let cwd = if !r.cwd.is_empty() {
+                            r.cwd.clone()
+                        } else {
+                            read_cwd_from_jsonl(&r.path, &r.source)
+                                .unwrap_or_else(|| "?".to_string())
+                        };
+                        confirm_resume = Some((r.session_id.clone(), r.path.clone(), cwd, r.source.clone()));
                     }
                 }
                 (View::Detail(_), KeyCode::Char('y') | KeyCode::Enter, _) => {
-                    if let Some((ref sid, ref path, _)) = confirm_resume {
-                        resume_session = Some((sid.clone(), path.clone()));
+                    if let Some((ref sid, ref path, _, ref source)) = confirm_resume {
+                        resume_session = Some((sid.clone(), path.clone(), source.clone()));
                         break;
                     }
                 }
@@ -564,27 +654,45 @@ fn search_tui(
     Ok(resume_session)
 }
 
-fn read_cwd_from_jsonl(path: &str) -> Option<String> {
+fn read_cwd_from_jsonl(path: &str, source: &str) -> Option<String> {
     let raw = std::fs::read_to_string(path).ok()?;
     for line in raw.lines() {
         let v: serde_json::Value = serde_json::from_str(line).ok()?;
-        if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
-            return Some(cwd.to_string());
+        if source == "codex" {
+            // Codex: cwd is in payload of session_meta entries
+            if v.get("type").and_then(|t| t.as_str()) == Some("session_meta") {
+                if let Some(cwd) = v.get("payload").and_then(|p| p.get("cwd")).and_then(|c| c.as_str()) {
+                    return Some(cwd.to_string());
+                }
+            }
+        } else {
+            // Claude: cwd is a top-level field
+            if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
+                return Some(cwd.to_string());
+            }
         }
     }
     None
 }
 
-fn launch_claude_resume(session_id: &str, jsonl_path: &str) -> Result<()> {
+fn launch_resume(session_id: &str, jsonl_path: &str, source: &str) -> Result<()> {
     use std::os::unix::process::CommandExt;
-    if let Some(cwd) = read_cwd_from_jsonl(jsonl_path) {
+    if let Some(cwd) = read_cwd_from_jsonl(jsonl_path, source) {
         let _ = std::env::set_current_dir(&cwd);
     }
-    eprintln!("Resuming session {session_id}...");
-    let err = std::process::Command::new("claude")
-        .args(["--resume", session_id])
-        .exec();
-    Err(err.into())
+    if source == "codex" {
+        eprintln!("Resuming codex session {session_id}...");
+        let err = std::process::Command::new("codex")
+            .args(["resume", session_id])
+            .exec();
+        Err(err.into())
+    } else {
+        eprintln!("Resuming claude session {session_id}...");
+        let err = std::process::Command::new("claude")
+            .args(["--resume", session_id])
+            .exec();
+        Err(err.into())
+    }
 }
 
 fn first_line(text: &str) -> String {
@@ -812,8 +920,8 @@ fn main() -> Result<()> {
         let q = query_args.join(" ");
         use std::io::IsTerminal;
         if std::io::stdout().is_terminal() {
-            if let Some((sid, path)) = search_tui(&db_name, &assets, &q, session_filter.as_deref())? {
-                launch_claude_resume(&sid, &path)?;
+            if let Some((sid, path, source)) = search_tui(&db_name, &assets, &q, session_filter.as_deref())? {
+                launch_resume(&sid, &path, &source)?;
             }
         } else {
             search_plain(&db_name, &assets, &q, session_filter.as_deref())?;
