@@ -70,9 +70,15 @@ make pickbrain
 
 The source lives in `examples/pickbrain/` and demonstrates how to use
 Witchcraft as a library: document ingestion, embedding, indexing, and hybrid
-search. There is also a pickbrain skill you can install and use directly
-from Claude Code, to answer questions requiring global knowledge of all your
-projects:
+search. To install pickbrain as a skill for both Claude Code and Codex:
+
+```
+make pickbrain-install
+```
+
+This puts the binary on your `PATH` and installs the skill definitions so
+you can use pickbrain directly from either tool to answer questions requiring
+global knowledge of all your projects:
 
 ![skill](skill.png)
 
