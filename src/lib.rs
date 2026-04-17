@@ -56,7 +56,7 @@ use arrow_array::builder::{
 };
 use arrow_array::builder::{BooleanBuilder, FixedSizeListBuilder};
 use arrow_array::RecordBatch;
-use arrow_schema::Schema;
+use arrow_schema::{DataType, Field, Schema};
 use candle_core::{Device, Tensor};
 use futures::TryStreamExt;
 use lancedb::index::scalar::{BTreeIndexBuilder, FtsIndexBuilder, FullTextSearchQuery};
@@ -262,7 +262,8 @@ fn build_record_batch(
     let mut hash_builder = StringBuilder::new();
 
     // Multivector builder: List<FixedSizeList<f32, 128>>
-    let inner_builder = FixedSizeListBuilder::new(Float32Builder::new(), EMBEDDING_DIM as i32);
+    let inner_builder = FixedSizeListBuilder::new(Float32Builder::new(), EMBEDDING_DIM as i32)
+        .with_field(Field::new("elem", DataType::Float32, true));
     let mut vectors_builder = ListBuilder::new(inner_builder);
 
     // Metadata builders (one per field, in schema order)
