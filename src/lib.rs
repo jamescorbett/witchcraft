@@ -33,7 +33,7 @@ pub mod filter;
 pub mod schema;
 pub mod types;
 
-pub use filter::{Filter, FilterOp, MetadataValue};
+pub use filter::{Filter, FilterCondition, FilterOp, MetadataValue};
 pub use schema::{MetadataField, MetadataFieldType, MetadataSchema};
 pub use types::{DocPtr, SearchResult};
 

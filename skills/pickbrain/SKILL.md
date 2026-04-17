@@ -28,10 +28,7 @@ Run `pickbrain` via Bash with the user's query:
 pickbrain "$ARGUMENTS"
 ```
 
-Pickbrain automatically ingests new sessions/memories before each search (cheap filesystem walk).
-New chunks are embedded using the same model load as the search query, so there is no extra startup cost.
-
-Use `pickbrain --update` (without a query) to force a full ingest+embed pass.
+Pickbrain automatically ingests new sessions, memories, and project config files (CLAUDE.md, AGENTS.md, and their @ references) before each search.
 
 ## Interpreting Results
 
@@ -54,8 +51,23 @@ To search within a specific session:
 pickbrain --session <session-id> "<query>"
 ```
 
+To exclude specific sessions from results (comma-separated or repeated):
+
+```bash
+pickbrain --exclude <uuid1>,<uuid2> "<query>"
+pickbrain --exclude <uuid1> --exclude <uuid2> "<query>"
+```
+
+To search only recent history:
+
+```bash
+pickbrain --since 24h "<query>"
+pickbrain --since 7d "<query>"
+pickbrain --since 2w "<query>"
+```
+
 ## Notes
 
 - First run requires a full ingest+embed pass (~7s). Subsequent searches auto-ingest incrementally.
-- The database lives at `~/.claude/pickbrain.db`.
+- The database lives at `~/.pickbrain/pickbrain.db`.
 - Results are ranked by semantic similarity — they may not contain the exact query words.

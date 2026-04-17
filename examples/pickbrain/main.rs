@@ -8,7 +8,7 @@ mod claude_code;
 mod codex;
 mod watermark;
 
-use witchcraft::{Filter, MetadataSchema, MetadataValue, Witchcraft};
+use witchcraft::{Filter, FilterCondition, FilterOp, MetadataSchema, MetadataValue, Witchcraft};
 
 struct SimpleLogger;
 impl log::Log for SimpleLogger {
@@ -29,7 +29,9 @@ static LOGGER: SimpleLogger = SimpleLogger;
 
 fn db_path() -> PathBuf {
     let home = env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".claude/pickbrain.lance")
+    let dir = PathBuf::from(home).join(".pickbrain");
+    std::fs::create_dir_all(&dir).ok();
+    dir.join("pickbrain.lance")
 }
 
 fn pickbrain_schema() -> MetadataSchema {
@@ -47,15 +49,15 @@ fn assets_path() -> PathBuf {
 }
 
 async fn ingest(wc: &mut Witchcraft) -> Result<bool> {
-    let (sessions, memories, authored) = claude_code::ingest_claude_code(wc).await?;
+    let (sessions, memories, authored, configs) = claude_code::ingest_claude_code(wc).await?;
     let codex_sessions = codex::ingest_codex(wc).await?;
-    let total = sessions + memories + authored + codex_sessions;
+    let total = sessions + memories + authored + configs + codex_sessions;
     if total == 0 {
         eprintln!("No new sessions to ingest.");
         return Ok(false);
     }
     eprintln!(
-        "ingested {sessions} claude sessions, {codex_sessions} codex sessions, {memories} memory files, {authored} authored files"
+        "ingested {sessions} claude sessions, {codex_sessions} codex sessions, {memories} memory files, {authored} authored files, {configs} config files"
     );
     Ok(true)
 }
@@ -144,12 +146,63 @@ fn read_turn_at(path: &str, source: &str, tm: &TurnMeta) -> Option<SessionTurn> 
 }
 
 
+/// Parse a duration string like "24h", "7d", "2w" into milliseconds.
+fn parse_since(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (num_str, unit) = s.split_at(s.len().saturating_sub(1));
+    let n: i64 = num_str.parse().ok()?;
+    let ms_per_unit = match unit {
+        "h" => 3_600_000,
+        "d" => 86_400_000,
+        "w" => 604_800_000,
+        _ => return None,
+    };
+    Some(n * ms_per_unit)
+}
+
 async fn run_search(
     wc: &mut Witchcraft,
     q: &str,
     session: Option<&str>,
+    exclude: &[String],
+    since_ms: Option<i64>,
 ) -> Result<(Vec<SearchResult>, u128)> {
-    let filter = session.map(|id| Filter::eq("session_id", MetadataValue::String(id.to_string())));
+    let session_filter = session.map(|id| Filter::eq("session_id", MetadataValue::String(id.to_string())));
+
+    let exclude_filter = if exclude.is_empty() {
+        None
+    } else {
+        let mut f = Filter::Empty;
+        for id in exclude {
+            f = f.and(Filter::Condition(FilterCondition {
+                field: "session_id".to_string(),
+                op: FilterOp::Ne,
+                value: Some(MetadataValue::String(id.clone())),
+            }));
+        }
+        Some(f)
+    };
+
+    let since_filter = since_ms.map(|ms| {
+        let cutoff_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            - ms / 1000;
+        let cutoff_dt = chrono::DateTime::from_timestamp(cutoff_secs, 0).unwrap();
+        let cutoff_iso = cutoff_dt.to_rfc3339();
+        Filter::Condition(FilterCondition {
+            field: "date".to_string(),
+            op: FilterOp::Gte,
+            value: Some(MetadataValue::String(cutoff_iso)),
+        })
+    });
+
+    let filter: Option<Filter> = [session_filter, exclude_filter, since_filter]
+        .into_iter()
+        .flatten()
+        .reduce(|acc, f| acc.and(f));
+
     let now = std::time::Instant::now();
     let results = wc.search(q, 0.5, 10, true, filter.as_ref()).await?;
     let search_ms = now.elapsed().as_millis();
@@ -204,8 +257,10 @@ async fn search_tui(
     wc: &mut Witchcraft,
     q: &str,
     session: Option<&str>,
+    exclude: &[String],
+    since_ms: Option<i64>,
 ) -> Result<Option<(String, String, String)>> {
-    let (results, search_ms) = run_search(wc, q, session).await?;
+    let (results, search_ms) = run_search(wc, q, session, exclude, since_ms).await?;
     if results.is_empty() {
         eprintln!("no results");
         return Ok(None);
@@ -661,8 +716,10 @@ async fn search_plain(
     wc: &mut Witchcraft,
     q: &str,
     session: Option<&str>,
+    exclude: &[String],
+    since_ms: Option<i64>,
 ) -> Result<()> {
-    let (results, search_ms) = run_search(wc, q, session).await?;
+    let (results, search_ms) = run_search(wc, q, session, exclude, since_ms).await?;
 
     let mut buf = Vec::new();
     writeln!(buf, "\n[[ {q} ]]")?;
@@ -848,6 +905,8 @@ async fn main() -> Result<()> {
 
     let args: Vec<String> = env::args().skip(1).collect();
     let mut session_filter: Option<String> = None;
+    let mut exclude_sessions: Vec<String> = Vec::new();
+    let mut since_ms: Option<i64> = None;
     let mut dump_session: Option<String> = None;
     let mut turns_range: Option<String> = None;
     let mut query_args: Vec<&str> = Vec::new();
@@ -870,6 +929,27 @@ async fn main() -> Result<()> {
             "--session" => {
                 session_filter = iter.next().cloned();
             }
+            "--exclude" => {
+                if let Some(val) = iter.next() {
+                    for id in val.split(',') {
+                        let id = id.trim();
+                        if !id.is_empty() {
+                            exclude_sessions.push(id.to_string());
+                        }
+                    }
+                }
+            }
+            "--since" => {
+                if let Some(val) = iter.next() {
+                    match parse_since(val) {
+                        Some(ms) => since_ms = Some(ms),
+                        None => {
+                            eprintln!("invalid --since value: {val} (use e.g. 24h, 7d, 2w)");
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            }
             "--dump" => {
                 dump_session = iter.next().cloned();
             }
@@ -882,9 +962,24 @@ async fn main() -> Result<()> {
         }
     }
 
+    use std::io::IsTerminal;
+    if std::io::stderr().is_terminal() {
+        eprintln!("pickbrain {} — Copyright (c) 2026 Dropbox Inc.", env!("CARGO_PKG_VERSION"));
+    }
+
     let db_name = db_path();
     let assets = assets_path();
     let schema = pickbrain_schema();
+
+    // Migrate DB from old location (~/.claude/pickbrain.lance)
+    if !db_name.exists() {
+        let home = env::var("HOME").unwrap_or_default();
+        let old_db = PathBuf::from(home).join(".claude/pickbrain.lance");
+        if old_db.exists() {
+            eprintln!("migrating database from {} to {}", old_db.display(), db_name.display());
+            std::fs::rename(&old_db, &db_name).ok();
+        }
+    }
 
     let mut wc = Witchcraft::new(&db_name, &assets, schema).await?;
 
@@ -904,16 +999,15 @@ async fn main() -> Result<()> {
         dump(&mut wc, sid, turns_range.as_deref()).await?;
     } else if !query_args.is_empty() {
         let q = query_args.join(" ");
-        use std::io::IsTerminal;
         if std::io::stdout().is_terminal() {
-            if let Some((sid, path, source)) = search_tui(&mut wc, &q, session_filter.as_deref()).await? {
+            if let Some((sid, path, source)) = search_tui(&mut wc, &q, session_filter.as_deref(), &exclude_sessions, since_ms).await? {
                 launch_resume(&sid, &path, &source)?;
             }
         } else {
-            search_plain(&mut wc, &q, session_filter.as_deref()).await?;
+            search_plain(&mut wc, &q, session_filter.as_deref(), &exclude_sessions, since_ms).await?;
         }
     } else {
-        eprintln!("Usage: pickbrain [--session UUID] <query>");
+        eprintln!("Usage: pickbrain [--session UUID] [--exclude UUID,...] [--since 24h|7d|2w] <query>");
         eprintln!("       pickbrain --dump <UUID> [--turns N-M]");
         eprintln!("       pickbrain --nuke");
     }

@@ -474,15 +474,77 @@ fn split_markdown(text: &str) -> Vec<String> {
     splitter.chunks(text).map(|c| c.to_string()).collect()
 }
 
+/// Extract `@path` references from a CLAUDE.md/AGENTS.md file.
+/// Handles both `@filename` directives and `references/foo.md - description` lines.
+fn extract_at_references(text: &str, base_dir: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        // @path reference (e.g. "@AGENTS.md", "@references/foo.md")
+        if let Some(rest) = trimmed.strip_prefix('@') {
+            let path_str = rest.split_whitespace().next().unwrap_or("");
+            if !path_str.is_empty() {
+                paths.push(base_dir.join(path_str));
+            }
+        }
+        // "references/foo.md - description" pattern
+        if let Some(path_str) = trimmed.split(" - ").next() {
+            let path_str = path_str.trim();
+            if path_str.ends_with(".md") && !path_str.contains(' ') {
+                let candidate = base_dir.join(path_str);
+                if candidate.is_file() {
+                    paths.push(candidate);
+                }
+            }
+        }
+    }
+    paths
+}
+
+/// Collect CLAUDE.md and AGENTS.md (plus @ references) from a project directory.
+fn collect_project_configs(project_dir: &Path) -> Vec<PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    let mut queue: Vec<PathBuf> = Vec::new();
+
+    for name in &["CLAUDE.md", "AGENTS.md"] {
+        let p = project_dir.join(name);
+        if p.is_file() {
+            queue.push(p);
+        }
+    }
+
+    let mut result = Vec::new();
+    while let Some(path) = queue.pop() {
+        let canonical = match path.canonicalize() {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if !seen.insert(canonical.clone()) {
+            continue;
+        }
+        if let Ok(text) = fs::read_to_string(&canonical) {
+            let base = canonical.parent().unwrap_or(project_dir);
+            for referenced in extract_at_references(&text, base) {
+                if referenced.is_file() {
+                    queue.push(referenced);
+                }
+            }
+        }
+        result.push(canonical);
+    }
+    result.sort();
+    result
+}
+
 use crate::watermark;
 
-pub async fn ingest_claude_code(wc: &mut Witchcraft) -> Result<(usize, usize, usize)> {
+pub async fn ingest_claude_code(wc: &mut Witchcraft) -> Result<(usize, usize, usize, usize)> {
     let home = std::env::var("HOME").unwrap_or_default();
     let projects_dir = PathBuf::from(&home).join(".claude/projects");
 
     if !projects_dir.is_dir() {
         println!("no Claude Code projects found at {}", projects_dir.display());
-        return Ok((0, 0, 0));
+        return Ok((0, 0, 0, 0));
     }
 
     let wm_path = watermark::claude_path();
@@ -491,6 +553,8 @@ pub async fn ingest_claude_code(wc: &mut Witchcraft) -> Result<(usize, usize, us
     let mut session_count = 0usize;
     let mut memory_count = 0usize;
     let mut authored_count = 0usize;
+    let mut config_count = 0usize;
+    let mut ingested_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     let mut entries: Vec<_> = fs::read_dir(&projects_dir)?
         .filter_map(|e| e.ok())
@@ -551,6 +615,7 @@ pub async fn ingest_claude_code(wc: &mut Witchcraft) -> Result<(usize, usize, us
                     continue;
                 }
                 println!("{}", md_path.display());
+                ingested_paths.insert(md_path.clone());
                 let mtime_ms = file_mtime_ms(md_path).unwrap_or(0);
                 match ingest_memory_file(wc, md_path, &project_name, mtime_ms).await {
                     Ok(true) => memory_count += 1,
@@ -571,6 +636,7 @@ pub async fn ingest_claude_code(wc: &mut Witchcraft) -> Result<(usize, usize, us
             }
             let mtime_ms = file_mtime_ms(md_path).unwrap_or(0);
             println!("{}", md_path.display());
+            ingested_paths.insert(md_path.clone());
             match ingest_authored_file(wc, md_path, &project_name, mtime_ms).await {
                 Ok(true) => authored_count += 1,
                 Ok(false) => {}
@@ -579,10 +645,30 @@ pub async fn ingest_claude_code(wc: &mut Witchcraft) -> Result<(usize, usize, us
                 }
             }
         }
+
+        // Ingest CLAUDE.md, AGENTS.md, and their @ references from the project dir
+        let real_project_dir = PathBuf::from("/").join(&project_name);
+        for config_path in collect_project_configs(&real_project_dir) {
+            if ingested_paths.contains(&config_path) {
+                continue;
+            }
+            if !watermark::file_newer_than(&config_path, wm_ts) {
+                continue;
+            }
+            let mtime_ms = file_mtime_ms(&config_path).unwrap_or(0);
+            println!("{}", config_path.display());
+            match ingest_authored_file(wc, &config_path, &project_name, mtime_ms).await {
+                Ok(true) => config_count += 1,
+                Ok(false) => {}
+                Err(e) => {
+                    log::warn!("failed to ingest config {}: {e}", config_path.display());
+                }
+            }
+        }
     }
 
     watermark::touch(&wm_path);
-    Ok((session_count, memory_count, authored_count))
+    Ok((session_count, memory_count, authored_count, config_count))
 }
 
 #[cfg(test)]

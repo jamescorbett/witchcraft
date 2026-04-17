@@ -77,6 +77,7 @@ pickbrain: download
 pickbrain-install: pickbrain
 	mkdir -p ~/bin ~/.claude/skills/pickbrain ~/.codex/skills/pickbrain
 	ln -f $(realpath pickbrain) ~/bin/pickbrain
+	rm -f ~/.claude/skills/pickbrain/skill.md ~/.codex/skills/pickbrain/skill.md
 	cp skills/pickbrain/SKILL.md ~/.claude/skills/pickbrain/SKILL.md
 	cp skills/pickbrain-codex/SKILL.md ~/.codex/skills/pickbrain/SKILL.md
 
