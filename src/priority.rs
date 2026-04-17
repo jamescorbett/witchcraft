@@ -111,4 +111,5 @@ mod platform_impl {
     }
 }
 
+#[allow(unused_imports)]
 pub use platform_impl::PriorityManager;

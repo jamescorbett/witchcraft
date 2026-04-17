@@ -1,8 +1,8 @@
 use log::{debug, info, warn};
-use once_cell::sync::Lazy;
-use rusqlite::Statement;
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::path::Path;
+use std::sync::Arc;
+
 // Conditionally compile T5 encoder based on features
 #[cfg(feature = "t5-quantized")]
 pub mod quantized_t5;
@@ -24,1501 +24,69 @@ compile_error!("Must enable exactly one T5 backend: t5-quantized or t5-openvino"
 #[cfg(all(feature = "t5-quantized", feature = "t5-openvino"))]
 compile_error!("Cannot enable multiple T5 backends simultaneously");
 
-// hybrid-dequant is a CPU-only optimization and cannot be used with Metal
-#[cfg(all(feature = "hybrid-dequant", feature = "metal"))]
-compile_error!("hybrid-dequant is incompatible with metal (use accelerate only for CPU, or metal without hybrid-dequant for GPU)");
-
-mod db;
-pub use db::DB;
-
 mod embedder;
 pub use embedder::Embedder;
 
 pub mod assets;
 
-mod packops;
-use packops::TensorPackOps;
-
-mod haarops;
-
-pub mod rans64;
-
-mod merger;
-
-mod priority;
-use priority::PriorityManager;
-
-mod progress_reporter;
-use progress_reporter::ProgressReporter;
-
+pub mod filter;
+pub mod schema;
 pub mod types;
-pub use types::SqlStatementInternal;
 
-mod sql_generator;
-use sql_generator::build_filter_sql_and_params;
+pub use filter::{Filter, FilterOp, MetadataValue};
+pub use schema::{MetadataField, MetadataFieldType, MetadataSchema};
+pub use types::{DocPtr, SearchResult};
+
+#[allow(dead_code)]
+mod priority;
+
+#[allow(dead_code)]
+mod progress_reporter;
+
+#[allow(dead_code)]
+mod histogram;
 
 #[cfg(feature = "napi")]
 #[allow(dead_code)]
 mod napi;
 
 use anyhow::Result;
-use candle_core::{DType, Device, IndexOp, Tensor, D};
-
-const EMBEDDING_DIM: usize = 128;
-
-/// A document pointer combining document ID and sub-chunk index
-/// Allows precise location of results within subdivided documents
-pub type DocPtr = (u32, u32);
-
-/// Mode for indexing operations - determines which chunks to process
-enum IndexMode {
-    /// Index all chunks (full rebuild)
-    Full,
-    /// Index only unindexed chunks (incremental update)
-    Incremental,
-}
-
-pub fn make_device() -> Device {
-    // Metal only works on Apple Silicon (ARM), not Intel x86_64
-    if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-        match Device::new_metal(0) {
-            Ok(device) => device,
-            Err(v) => {
-                warn!("unable to create metal device: {v}");
-                Device::Cpu
-            }
-        }
-    } else {
-        Device::Cpu
-    }
-}
-
-#[cfg(all(feature = "progress", not(feature = "napi")))]
-pub mod progress {
-    use indicatif::{ProgressBar, ProgressStyle};
-
-    pub struct Bar {
-        pb: ProgressBar,
-    }
-
-    pub fn new_with_label(len: u64, label: &str) -> Bar {
-        let pb = ProgressBar::new(len);
-        if !label.is_empty() {
-            let style = ProgressStyle::default_bar()
-                .template(&format!("{{msg}} [{{bar:40}}] {{pos}}/{{len}}"))
-                .unwrap();
-            pb.set_style(style);
-            pb.set_message(label.to_string());
-        }
-        Bar { pb }
-    }
-
-    impl Bar {
-        pub fn inc(&self, n: u64) {
-            self.pb.inc(n);
-        }
-
-        pub fn finish(&self) {
-            self.pb.finish();
-        }
-    }
-}
-
-#[cfg(feature = "napi")]
-pub mod progress {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    pub struct Bar {
-        total: u64,
-        current: AtomicU64,
-        label: String,
-    }
-
-    pub fn new_with_label(len: u64, label: &str) -> Bar {
-        Bar {
-            total: len,
-            current: AtomicU64::new(0),
-            label: label.to_string(),
-        }
-    }
-
-    impl Bar {
-        pub fn inc(&self, n: u64) {
-            let current = self.current.fetch_add(n, Ordering::Relaxed) + n;
-            if self.total > 0 {
-                let progress = (current as f64) / (self.total as f64);
-                crate::napi::progress_update(progress.min(1.0), &self.label);
-            }
-        }
-
-        pub fn finish(&self) {
-            crate::napi::progress_update(1.0, &self.label);
-        }
-    }
-}
-
-#[cfg(not(any(feature = "progress", feature = "napi")))]
-pub mod progress {
-    #[derive(Clone, Copy)]
-    pub struct Bar;
-
-    pub fn new_with_label(_len: u64, _label: &str) -> Bar {
-        Bar
-    }
-
-    impl Bar {
-        pub fn inc(&self, _n: u64) {}
-        pub fn finish(&self) {}
-    }
-}
-
-fn matmul_argmax_batched(
-    t: &Tensor,
-    centers: &fast_ops::PackedRight,
-    batch_size: usize,
-) -> Result<Tensor> {
-    let (m, _n) = t.dims2()?;
-    let device = t.device();
-
-    let mut assignments = Vec::with_capacity(m);
-
-    for start in (0..m).step_by(batch_size) {
-        let end = (start + batch_size).min(m);
-        let batch_len = end - start;
-        let batch = t.narrow(0, start, batch_len)?;
-        let sim = centers.matmul(&batch)?;
-        let batch_assignments = sim.argmax(D::Minus1)?;
-        let batch_assignments = batch_assignments.to_vec1::<u32>()?;
-        assignments.extend(batch_assignments);
-    }
-
-    Ok(Tensor::from_vec(assignments, m, device)?)
-}
-
-fn kmeans(data: &Tensor, k: usize, max_iter: usize) -> Result<Tensor> {
-    let (m, n) = data.dims2()?;
-    debug!("kmeans k={} m={} n={}...", k, m, n);
-
-    let _priority_mgr = PriorityManager::new();
-    let total: u64 = (max_iter * k).try_into()?;
-    let bar = progress::new_with_label(total, "kmeans");
-    let device = data.device();
-
-    let mut rng = rand::rng();
-    let centroid_idx = rand::seq::index::sample(&mut rng, m, k).into_vec();
-    let centroid_idx: Vec<u32> = centroid_idx.iter().map(|&i| i as u32).collect();
-
-    let centroid_idx_tensor = Tensor::from_slice(centroid_idx.as_slice(), (k,), device)?;
-    //let centroid_idx_tensor = centroid_idx_tensor.to_device(device)?;
-    let mut centers = data.index_select(&centroid_idx_tensor, 0)?;
-
-    // Pull data out once; kmeans always runs on CPU.
-    let data_flat = data.flatten_all()?.to_vec1::<f32>()?;
-
-    for _ in 0..max_iter {
-        let packed_centers = fast_ops::PackedRight::new(&centers)?;
-        let cluster_assignments = matmul_argmax_batched(data, &packed_centers, 1024)?;
-        let assignments = cluster_assignments.to_vec1::<u32>()?;
-
-        // Single O(m × n) pass: accumulate per-cluster sums directly into a
-        // flat Vec<f32>, avoiding O(k × m) scans and k separate tensor ops.
-        let mut sums = vec![0f32; k * n];
-        let mut counts = vec![0u32; k];
-        for (j, &c) in assignments.iter().enumerate() {
-            let c = c as usize;
-            counts[c] += 1;
-            let src = &data_flat[j * n..(j + 1) * n];
-            let dst = &mut sums[c * n..(c + 1) * n];
-            for (d, s) in dst.iter_mut().zip(src) {
-                *d += s;
-            }
-        }
-
-        // Normalize each cluster sum; reinit empty clusters from a random point.
-        let mut centers_flat = vec![0f32; k * n];
-        for i in 0..k {
-            let src = &sums[i * n..(i + 1) * n];
-            let dst = &mut centers_flat[i * n..(i + 1) * n];
-            let (emb, owned);
-            if counts[i] > 0 {
-                emb = src;
-            } else {
-                let idx = rand::seq::index::sample(&mut rng, m, 1).into_vec()[0];
-                owned = data_flat[idx * n..(idx + 1) * n].to_vec();
-                emb = &owned;
-            }
-            let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm > 0.0 {
-                for (d, e) in dst.iter_mut().zip(emb) {
-                    *d = e / norm;
-                }
-            } else {
-                dst.copy_from_slice(emb);
-            }
-        }
-
-        centers = Tensor::from_vec(centers_flat, (k, n), device)?;
-        bar.inc(k as u64);
-    }
-    bar.finish();
-    Ok(centers)
-}
-
-fn compress_keys(keys: &[(u32, u32)]) -> Vec<u8> {
-    let mut bytes = Vec::with_capacity(keys.len() * 8);
-    let mut iter = keys.iter();
-
-    // Store first key as-is
-    if let Some(&(major, minor)) = iter.next() {
-        bytes.extend_from_slice(&major.to_ne_bytes());
-        bytes.extend_from_slice(&minor.to_ne_bytes());
-
-        let mut base = (major, minor);
-
-        for &(major, minor) in iter {
-            let delta_major = major - base.0;
-            let delta_minor = if delta_major == 0 {
-                minor - base.1
-            } else {
-                minor
-            };
-
-            bytes.extend_from_slice(&delta_major.to_ne_bytes());
-            bytes.extend_from_slice(&delta_minor.to_ne_bytes());
-
-            base = (major, minor);
-        }
-    }
-
-    lz4_flex::block::compress_prepend_size(&bytes)
-}
-
-fn decompress_keys(bytes: &[u8]) -> Result<Vec<(u32, u32)>> {
-    let decompressed = lz4_flex::block::decompress_size_prepended(bytes)?;
-    let mut keys = Vec::with_capacity(decompressed.len() / 8);
-    let mut chunks = decompressed.chunks_exact(8);
-
-    // decode first key as absolute
-    if let Some(chunk) = chunks.next() {
-        let major = u32::from_ne_bytes(chunk[0..4].try_into()?);
-        let minor = u32::from_ne_bytes(chunk[4..8].try_into()?);
-
-        let mut base = (major, minor);
-        keys.push(base);
-
-        for chunk in chunks {
-            let delta_major = u32::from_ne_bytes(chunk[0..4].try_into()?);
-            let delta_minor = u32::from_ne_bytes(chunk[4..8].try_into()?);
-
-            let major = base.0.wrapping_add(delta_major);
-            let minor = if delta_major == 0 {
-                base.1.wrapping_add(delta_minor)
-            } else {
-                delta_minor
-            };
-
-            base = (major, minor);
-            keys.push(base);
-        }
-    }
-
-    Ok(keys)
-}
-
-fn write_buckets(
-    db: &DB,
-    centers: &Tensor,
-    device: &Device,
-    mode: IndexMode,
-    expected_count: u64,
-) -> Result<(Vec<tempfile::NamedTempFile>, Vec<u32>, Tensor)> {
-    let _priority_mgr = PriorityManager::new();
-    let mut mmuls_total = 0;
-    let mut writes_total = 0;
-
-    let bar = progress::new_with_label(expected_count, "indexing");
-
-    let mut document_indices = Vec::<(u32, u32)>::new();
-    let mut all_chunkids = vec![];
-    let mut all_embeddings = vec![];
-
-    let embeddings_sql = match mode {
-        IndexMode::Full => {
-            "SELECT document.rowid,chunk.rowid,chunk.embeddings,chunk.counts FROM document,chunk
-            WHERE document.hash = chunk.hash
-            ORDER BY document.rowid"
-        }
-        IndexMode::Incremental => {
-            "SELECT document.rowid,chunk.rowid,chunk.embeddings,chunk.counts FROM document,chunk
-            WHERE document.hash = chunk.hash
-            AND NOT EXISTS (SELECT 1 FROM indexed_chunk WHERE chunkid = chunk.rowid)
-            ORDER BY document.rowid"
-        }
-    };
-
-    let mut query = db.query(embeddings_sql)?;
-
-    let mut results = query.query_map((), |row| {
-        Ok((
-            row.get::<_, u32>(0)?,
-            row.get::<_, u32>(1)?,
-            row.get::<_, Vec<u8>>(2)?,
-            row.get::<_, String>(3)?,
-        ))
-    })?;
-
-    let mut done = false;
-    let mut batch = 0;
-    let mut tmpfiles = vec![];
-    let centers_cpu = centers.to_device(&Device::Cpu)?;
-    let packed_centers = fast_ops::PackedRight::new(centers)?;
-    while !done {
-        match results.next() {
-            Some(result) => {
-                let (id, chunkid, embeddings, counts) = result?;
-
-                let t = Tensor::embeddings_from_packed(&embeddings, EMBEDDING_DIM, &Device::Cpu)?;
-                let split = split_tensor(&t);
-                let m = split.len();
-
-                for (i, count) in counts
-                    .split(',')
-                    .filter_map(|s| s.parse::<u32>().ok())
-                    .enumerate()
-                {
-                    for _ in 0..count {
-                        document_indices.push((id, i as u32));
-                    }
-                }
-                all_chunkids.push(chunkid);
-                all_embeddings.extend(split);
-                batch += m;
-            }
-            None => {
-                done = true;
-            }
-        }
-
-        let batch_size = 0x10000;
-
-        if batch >= batch_size || done {
-            let now = std::time::Instant::now();
-
-            let take = batch.min(batch_size);
-            let left = batch - take;
-
-            let embeddings = all_embeddings.split_off(left);
-            let indices = document_indices.split_off(left);
-            let data = Tensor::cat(&embeddings, 0)?.to_device(device)?;
-
-            // Use batched matmul+argmax to avoid materializing huge intermediate matrix
-            let cluster_assignments =
-                matmul_argmax_batched(&data, &packed_centers, 1024)?.to_device(&Device::Cpu)?;
-            debug!("simmax took {} ms", now.elapsed().as_millis());
-            mmuls_total += now.elapsed().as_millis();
-
-            let now = std::time::Instant::now();
-            let mut writer = merger::Writer::new()?;
-
-            let mut pairs: Vec<(usize, u32)> = cluster_assignments
-                .to_vec1::<u32>()?
-                .iter()
-                .enumerate()
-                .map(|(i, &bucket)| (i, bucket))
-                .collect();
-            pairs.sort_by_key(|&(_, bucket)| bucket);
-
-            let mut keys: Vec<(u32, u32)> = Vec::with_capacity(take);
-            let mut residuals_bytes: Vec<u8> = Vec::with_capacity(take * 64);
-            let (_, mut prev_bucket) = pairs[0];
-
-            for (sample, bucket) in pairs.iter().copied().chain(std::iter::once((0, u32::MAX))) {
-                let bucket_done = bucket == u32::MAX;
-
-                if (bucket != prev_bucket || bucket_done) && !keys.is_empty() {
-                    assert!(prev_bucket < bucket);
-                    writer.write_record(prev_bucket, &keys, &residuals_bytes)?;
-
-                    keys.clear();
-                    residuals_bytes.clear();
-                    prev_bucket = bucket;
-                }
-
-                if bucket_done {
-                    break;
-                }
-
-                match indices.get(sample) {
-                    Some(pair) => {
-                        keys.push(*pair);
-                    }
-                    None => {
-                        warn!("unable to get key pair from indices @{sample}");
-                        keys.push((0, 0));
-                    }
-                }
-
-                let center = centers_cpu.get(bucket as usize)?;
-                let residual = (embeddings[sample].get(0) - &center)?;
-                let residual_quantized = residual.compand()?.quantize(4)?.to_q4_bytes()?;
-                residuals_bytes.extend(&residual_quantized);
-            }
-            tmpfiles.push(writer.finish()?);
-            writes_total += now.elapsed().as_millis();
-            bar.inc(take as u64);
-
-            batch = left;
-        }
-    }
-    bar.finish();
-
-    debug!("mmuls took {} ms.", mmuls_total);
-    debug!("writes took {} ms.", writes_total);
-
-    Ok((tmpfiles, all_chunkids, centers_cpu))
-}
-
-fn merge_and_write_buckets(
-    db: &DB,
-    tmpfiles: Vec<tempfile::NamedTempFile>,
-    all_chunkids: &[u32],
-    centers_cpu: &Tensor,
-    id_offset: u32,
-) -> Result<()> {
-    let mut merger = merger::Merger::from_tempfiles(tmpfiles)?;
-    for result in &mut merger {
-        let entry = result?;
-        let center = centers_cpu.get(entry.value as usize)?;
-        let center_bytes = center.to_f32_bytes()?;
-        let compressed_keys = compress_keys(&entry.keys);
-        db.add_bucket(
-            id_offset + entry.value,
-            &center_bytes,
-            &compressed_keys,
-            &entry.data,
-        )?;
-    }
-    info!("write {} chunk ids to indexed_chunk", all_chunkids.len());
-    for &chunkid in all_chunkids {
-        db.add_indexed_chunk(chunkid)?;
-    }
-    Ok(())
-}
-
-pub fn fulltext_search(
-    db: &DB,
-    q: &str,
-    top_k: usize,
-    sql_filter: Option<&SqlStatementInternal>,
-) -> Result<Vec<(f32, u32, u32)>> {
-    let mut fts_matches = vec![];
-
-    let mut last_is_space = false;
-    for c in q.chars() {
-        last_is_space = c == ' ';
-    }
-    let q: String = q
-        .chars()
-        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
-        .collect();
-
-    let (filter_sql, mut filter_params) = build_filter_sql_and_params(sql_filter)?;
-    let filter_clause = if !filter_sql.is_empty() {
-        format!("AND {}", filter_sql)
-    } else {
-        String::new()
-    };
-
-    let q_param = if last_is_space {
-        q.trim().to_string()
-    } else {
-        format!("{q}*")
-    };
-
-    let sql = if !q.is_empty() {
-        format!(
-            "SELECT document.rowid, document.body, document.lens,
-            bm25(document_fts) AS score
-            FROM document,document_fts
-            WHERE document.rowid = document_fts.rowid
-            AND document_fts MATCH ? {filter_clause}
-            ORDER BY score,date DESC
-            LIMIT ?",
-        )
-    } else {
-        // For empty query, we don't need the query param in the WHERE clause
-        format!(
-            "SELECT rowid,\"\",\"\",0.0
-            FROM document
-            WHERE 1=1 {filter_clause}
-            ORDER BY date DESC
-            LIMIT ?",
-        )
-    };
-
-    let mut query = db.query(&sql)?;
-
-    // Build complete params list: query param (if q.len() > 0), filter params, top_k
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-    if !q.is_empty() {
-        params.push(Box::new(q_param.clone()));
-    }
-    params.append(&mut filter_params);
-    params.push(Box::new(top_k as i64));
-
-    let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-
-    let results = query.query_map(param_refs.as_slice(), |row| {
-        Ok((
-            row.get::<_, u32>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, f32>(3)?,
-        ))
-    })?;
-    for result in results {
-        let (rowid, body, lens, _score) = result?;
-        let score2 = strsim::jaro_winkler(&q_param, &body) as f32;
-
-        let lens: Vec<usize> = lens
-            .split(',')
-            .filter_map(|s| s.parse::<usize>().ok())
-            .collect();
-
-        let mut max = -1.0f64;
-        let mut i_max = 0;
-        if !lens.is_empty() {
-            let bodies = split_by_codepoints(&body, &lens);
-            for (i, &b) in bodies.iter().enumerate() {
-                let score = strsim::jaro_winkler(&q_param, b);
-                if score > max {
-                    max = score;
-                    i_max = i;
-                }
-            }
-        }
-        fts_matches.push((score2, rowid, i_max as u32));
-    }
-    info!("full text found {} matches", fts_matches.len());
-    Ok(fts_matches)
-}
-
-pub fn reciprocal_rank_fusion(list1: &[DocPtr], list2: &[DocPtr], k: f64) -> Vec<DocPtr> {
-    let mut scores: HashMap<DocPtr, f64> = HashMap::new();
-
-    for (rank, &doc_id) in list1.iter().enumerate() {
-        let score = 1.0 / (3.0 + k + rank as f64);
-        *scores.entry(doc_id).or_insert(0.0) += score;
-    }
-
-    for (rank, &doc_id) in list2.iter().enumerate() {
-        let score = 1.0 / (k + rank as f64);
-        *scores.entry(doc_id).or_insert(0.0) += score;
-    }
-
-    let mut results: Vec<(DocPtr, f64)> = scores.into_iter().collect();
-    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap()); // Sort descending by score
-    let results: Vec<DocPtr> = results.iter().map(|&(idx, _)| idx).collect();
-    results
-}
-
-type CentersCache = (Vec<u32>, Vec<usize>, Vec<Tensor>, Tensor);
-
-static CACHED: Lazy<RwLock<Option<CentersCache>>> = Lazy::new(|| RwLock::new(None));
-
-fn invalidate_center_cache() {
-    *CACHED.write().unwrap() = None;
-}
-
-#[allow(clippy::type_complexity)]
-fn get_centers(db: &DB, device: &Device) -> Result<(Vec<u32>, Vec<usize>, Vec<Tensor>, Tensor)> {
-    let now = std::time::Instant::now();
-    {
-        let cache_lock_start = std::time::Instant::now();
-        let cache = CACHED.read().unwrap();
-        let lock_time = cache_lock_start.elapsed().as_micros();
-        if let Some((cluster_ids, sizes, centers, tensor)) = &*cache {
-            let clone_start = std::time::Instant::now();
-            let result = Ok((
-                cluster_ids.clone(),
-                sizes.clone(),
-                centers.clone(),
-                tensor.clone(),
-            ));
-            debug!(
-                "get_centers cache hit: lock {}μs, clone {}μs",
-                lock_time,
-                clone_start.elapsed().as_micros()
-            );
-            return result;
-        }
-    }
-
-    let mut center_query =
-        db.query("SELECT id,length(residuals)/64,center FROM bucket ORDER BY id")?;
-    let mut cluster_ids = vec![];
-    let mut sizes = vec![];
-    let mut centers = vec![];
-    for result in center_query.query_map((), |row| {
-        let id = row.get(0)?;
-        let size = row.get(1)?;
-        let blob: Vec<u8> = row.get(2)?;
-        Ok((id, size, blob))
-    })? {
-        let (id, size, center) = result?;
-        cluster_ids.push(id);
-        sizes.push(size);
-        let t = Tensor::from_f32_bytes(&center, EMBEDDING_DIM, &Device::Cpu)?.flatten_all()?;
-        centers.push(t);
-    }
-    let tensor = if !centers.is_empty() {
-        Tensor::stack(&centers, 0)?.to_device(device)?
-    } else {
-        Tensor::zeros(&[0, EMBEDDING_DIM], DType::F32, device)?
-    };
-    debug!(
-        "reading and stacking centers took {} ms (caching result for future queries.)",
-        now.elapsed().as_millis()
-    );
-
-    let mut cache = CACHED.write().unwrap();
-    *cache = Some((
-        cluster_ids.clone(),
-        sizes.clone(),
-        centers.clone(),
-        tensor.clone(),
-    ));
-
-    Ok((cluster_ids, sizes, centers, tensor))
-}
-
-#[inline(always)]
-fn vmax_inplace(current: &mut [f32], row: &[f32]) {
-    debug_assert_eq!(current.len(), row.len());
-    // Process 8 at a time (helps LLVM emit SIMD), then handle the tail.
-    let (c8, c_tail) = current.as_chunks_mut::<8>();
-    let (r8, r_tail) = row.as_chunks::<8>();
-
-    for (c, r) in c8.iter_mut().zip(r8.iter()) {
-        // Unrolled 8-lane max; safe, no bounds checks in the loop body.
-        c[0] = c[0].max(r[0]);
-        c[1] = c[1].max(r[1]);
-        c[2] = c[2].max(r[2]);
-        c[3] = c[3].max(r[3]);
-        c[4] = c[4].max(r[4]);
-        c[5] = c[5].max(r[5]);
-        c[6] = c[6].max(r[6]);
-        c[7] = c[7].max(r[7]);
-    }
-
-    for (c, &r) in c_tail.iter_mut().zip(r_tail.iter()) {
-        *c = c.max(r);
-    }
-}
-
-pub fn match_centroids(
-    db: &DB,
-    query_embeddings: &Tensor,
-    threshold: f32,
-    top_k: usize,
-    sql_filter: Option<&SqlStatementInternal>,
-) -> Result<Vec<(f32, u32, u32)>> {
-    let total_start = std::time::Instant::now();
-    let setup_start = std::time::Instant::now();
-
-    let query_prep_start = std::time::Instant::now();
-    let mut bucket_query = db.query("SELECT indices,residuals FROM bucket WHERE id = ?1")?;
-    let query_prep_time = query_prep_start.elapsed().as_millis();
-
-    let k = 32;
-    let t_prime = 40000;
-    let device = query_embeddings.device();
-    let (m, _n) = query_embeddings.dims2()?;
-
-    let mut all_residuals = vec![]; // Store residuals, not full embeddings
-    let mut document_clusters = vec![]; // Track which cluster each document belongs to
-    let mut all = vec![];
-    let mut count = 0;
-    let mut missing = vec![];
-    let mut query_centroid_scores: Vec<Vec<f32>> = vec![]; // Centroid scores for reuse
-
-    let centers_start = std::time::Instant::now();
-    let (cluster_ids, sizes, centers, centers_matrix) = get_centers(db, device)?;
-    let centers_time = centers_start.elapsed().as_millis();
-
-    debug!(
-        "setup: bucket query prep {}ms, get_centers {}ms, total {}ms",
-        query_prep_time,
-        centers_time,
-        setup_start.elapsed().as_millis()
-    );
-
-    if !centers.is_empty() {
-        let now = std::time::Instant::now();
-
-        let query_centroid_similarity = fast_ops::matmul_t(query_embeddings, &centers_matrix)?;
-        let query_centroid_similarity = query_centroid_similarity.to_device(&Device::Cpu)?;
-
-        // Extract centroid scores for later use (m queries × n_clusters)
-        query_centroid_scores = query_centroid_similarity.to_vec2::<f32>()?;
-
-        let sorted_indices = query_centroid_similarity.arg_sort_last_dim(false)?;
-        let (m, n) = sorted_indices.dims2()?;
-
-        let mut topk_clusters = Vec::with_capacity(k);
-        for i in 0..m {
-            let row = sorted_indices.get(i)?;
-            let row_scores_sorted = query_centroid_similarity.get(i)?.gather(&row, D::Minus1)?;
-            let row_scores_sorted = row_scores_sorted.to_vec1::<f32>()?;
-            let row = row.to_vec1::<u32>()?;
-            let mut cumsum = 0;
-            let mut score = 0.0f32;
-            for j in 0..n.min(k) {
-                let idx = row[j];
-                topk_clusters.push(idx);
-                let size = sizes[idx as usize];
-                if cumsum < t_prime {
-                    score = row_scores_sorted[j];
-                }
-                cumsum += size;
-
-                if cumsum >= t_prime {
-                    break;
-                }
-            }
-            missing.push(score);
-        }
-        topk_clusters.sort_unstable();
-        topk_clusters.dedup();
-        debug!(
-            "finding top-{} out of {} clusters took {} ms.",
-            topk_clusters.len(),
-            n,
-            now.elapsed().as_millis()
-        );
-
-        let now = std::time::Instant::now();
-        let table: [f32; 16] = packops::make_q4_dequant_table()?;
-
-        let mut db_read_time = 0u128;
-        let mut decompress_time = 0u128;
-        let mut dequant_time = 0u128;
-
-        for i in topk_clusters {
-            let db_start = std::time::Instant::now();
-            let (keys_compressed, document_embeddings) = bucket_query
-                .query_row((cluster_ids[i as usize],), |row| {
-                    Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-                })?;
-            db_read_time += db_start.elapsed().as_millis();
-
-            match centers.get(i as usize) {
-                Some(_center) => {
-                    let decompress_start = std::time::Instant::now();
-                    let document_indices = decompress_keys(&keys_compressed)?;
-                    decompress_time += decompress_start.elapsed().as_millis();
-
-                    let dequant_start = std::time::Instant::now();
-                    let residuals = Tensor::from_companded_q4_bytes(
-                        &document_embeddings,
-                        EMBEDDING_DIM,
-                        &table,
-                        &Device::Cpu,
-                    )?;
-                    dequant_time += dequant_start.elapsed().as_millis();
-
-                    // Store residuals (not embeddings) and track cluster membership
-                    let (num_docs, _) = residuals.dims2()?;
-                    all_residuals.push(residuals);
-                    for idx in &document_indices[..num_docs] {
-                        document_clusters.push(i as usize); // Track which cluster this doc belongs to
-                        all.push((*idx, count));
-                        count += 1;
-                    }
-                }
-                None => {
-                    warn!("OOB array access i={i}, skipping entry!");
-                }
-            }
-        }
-        debug!(
-            "reading {} indexed embeddings took {} ms (DB: {}ms, decompress keys: {}ms, dequant: {}ms).",
-            count,
-            now.elapsed().as_millis(),
-            db_read_time,
-            decompress_time,
-            dequant_time
-        );
-    } else {
-        missing.resize(missing.len() + m, 0.0);
-    }
-
-    let missing_similarities = Tensor::from_vec(missing, m, &Device::Cpu)?;
-
-    let missing_score = missing_similarities.mean(0)?.to_scalar::<f32>()?;
-    let cutoff = if missing_score > threshold {
-        missing_score
-    } else {
-        threshold
-    };
-
-    let now = std::time::Instant::now();
-    let mut num_unindexed = 0;
-    let mut unindexed_embeddings = vec![];
-
-    // Check if there are any unindexed chunks before running expensive query
-    let unindexed_count: u32 = db
-        .query("SELECT COUNT(*) FROM chunk AS c WHERE NOT EXISTS (SELECT 1 FROM indexed_chunk AS i WHERE i.chunkid = c.rowid)")?
-        .query_row((), |row| row.get(0))?;
-
-    if unindexed_count > 0 {
-        let mut unindexed_chunks_query = db.query(
-            "
-            SELECT d.rowid, c.embeddings
-            FROM document AS d
-            JOIN chunk AS c ON c.hash = d.hash
-            WHERE NOT EXISTS (
-              SELECT 1
-              FROM indexed_chunk AS i
-              WHERE i.chunkid = c.rowid
-            )
-            ORDER BY d.rowid",
-        )?;
-
-        let results = unindexed_chunks_query.query_map((), |row| {
-            Ok((row.get::<_, u32>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })?;
-        for result in results {
-            let (id, embeddings) = result?;
-            let embeddings =
-                Tensor::embeddings_from_packed(&embeddings, EMBEDDING_DIM, &Device::Cpu)?;
-            let (num_docs, _) = embeddings.dims2()?;
-            unindexed_embeddings.push(embeddings);
-            for _ in 0..num_docs {
-                let key = (id, 0);
-                all.push((key, count));
-                count += 1;
-            }
-            num_unindexed += num_docs;
-        }
-    }
-    debug!(
-        "reading {} unindexed embeddings took {} ms.",
-        num_unindexed,
-        now.elapsed().as_millis()
-    );
-
-    if count == 0 {
-        return Ok(vec![]);
-    }
-
-    let now = std::time::Instant::now();
-    let n = m; // Number of queries
-
-    let mut sim: Vec<f32> = Vec::with_capacity(count * n);
-
-    // Process indexed embeddings: compute query·residuals and add centroid scores
-    if !all_residuals.is_empty() {
-        let all_residuals = Tensor::cat(&all_residuals, 0)?;
-        let all_residuals = all_residuals.to_device(query_embeddings.device())?;
-
-        let residual_sims =
-            fast_ops::matmul_t(query_embeddings, &all_residuals)?.transpose(0, 1)?;
-        let residual_sims = residual_sims.to_device(&Device::Cpu)?;
-        let residual_sims = residual_sims.to_dtype(DType::F32)?.contiguous()?;
-        let (num_indexed, _) = residual_sims.dims2()?;
-
-        // Add centroid scores to get final similarities for indexed documents
-        let mut residual_sims_flat = residual_sims.flatten_all()?.to_vec1::<f32>()?;
-        for (doc_idx, cluster_idx) in document_clusters.iter().enumerate().take(num_indexed) {
-            for (query_idx, centroid_scores) in query_centroid_scores.iter().enumerate().take(n) {
-                let offset = doc_idx * n + query_idx;
-                residual_sims_flat[offset] += centroid_scores[*cluster_idx];
-            }
-        }
-        sim.extend_from_slice(&residual_sims_flat);
-    }
-
-    // Process unindexed embeddings: compute full similarities
-    if !unindexed_embeddings.is_empty() {
-        let all_unindexed = Tensor::cat(&unindexed_embeddings, 0)?;
-        let all_unindexed = all_unindexed.to_device(query_embeddings.device())?;
-
-        let unindexed_sims =
-            fast_ops::matmul_t(query_embeddings, &all_unindexed)?.transpose(0, 1)?;
-        let unindexed_sims = unindexed_sims.to_device(&Device::Cpu)?;
-        let unindexed_sims = unindexed_sims.to_dtype(DType::F32)?.contiguous()?;
-        let unindexed_sims_flat = unindexed_sims.flatten_all()?.to_vec1::<f32>()?;
-        sim.extend_from_slice(&unindexed_sims_flat);
-    }
-
-    debug!(
-        "computing similarities for {} total embeddings took {} ms.",
-        count,
-        now.elapsed().as_millis()
-    );
-
-    let row_at = |pos: usize| -> &[f32] {
-        let start = pos * n;
-        &sim[start..start + n]
-    };
-
-    let missing_similarities = missing_similarities.contiguous()?.to_vec1::<f32>()?;
-
-    let now = std::time::Instant::now();
-    all.sort_unstable();
-    debug!(
-        "sorting {} rows took {}ms",
-        all.len(),
-        now.elapsed().as_millis()
-    );
-
-    let now = std::time::Instant::now();
-    let mut sub_scores = vec![0.0f32; n];
-    sub_scores.copy_from_slice(&missing_similarities);
-    let mut doc_scores = vec![0.0f32; n];
-    doc_scores.copy_from_slice(&missing_similarities);
-
-    db.execute(
-        "CREATE TEMPORARY TABLE temp2(rowid INTEGER, sub_idx INTEGER, score FLOAT, UNIQUE(rowid, sub_idx))",
-    )?;
-    let mut insert_temp_query = db.query("INSERT INTO temp2 VALUES(?1, ?2, ?3)")?;
-
-    let mut prev_idx = u32::MAX;
-    let mut prev_sub_idx = u32::MAX;
-
-    let scaler = 1.0f32 / n as f32;
-    for i in 0.. {
-        let ((idx, sub_idx), pos) = all[i];
-
-        let is_last = i == all.len() - 1;
-
-        let idx_change = prev_idx != idx;
-        let sub_idx_change = idx_change || prev_sub_idx != sub_idx;
-
-        if i > 0 {
-            if sub_idx_change || is_last {
-                let sub_score = scaler * (sub_scores.iter().copied().sum::<f32>());
-                if sub_score > cutoff {
-                    let _ = insert_temp_query.execute((prev_idx, prev_sub_idx, sub_score));
-                }
-                vmax_inplace(&mut doc_scores, &sub_scores);
-                sub_scores.copy_from_slice(&doc_scores);
-            }
-            if idx_change || is_last {
-                doc_scores.copy_from_slice(&missing_similarities);
-                sub_scores.copy_from_slice(&missing_similarities);
-            }
-        }
-
-        if is_last {
-            break;
-        }
-
-        let row = row_at(pos);
-        vmax_inplace(&mut sub_scores, row);
-
-        assert!(i == 0 || prev_idx <= idx);
-        assert!(i == 0 || (prev_idx != idx || prev_sub_idx <= sub_idx));
-        prev_idx = idx;
-        prev_sub_idx = sub_idx;
-    }
-
-    let (filter_sql, filter_params) = build_filter_sql_and_params(sql_filter)?;
-    let filter_clause = if !filter_sql.is_empty() {
-        format!("AND {}", filter_sql)
-    } else {
-        String::new()
-    };
-
-    let sql = format!(
-        "SELECT score,document.rowid,sub_idx
-        FROM document,temp2
-        WHERE document.rowid = temp2.rowid
-        {filter_clause}
-        ORDER BY score DESC
-        LIMIT ?",
-    );
-
-    let query_start = std::time::Instant::now();
-    let results_status: Result<Vec<(f32, u32, u32)>> = {
-        let mut scored_documents_query = db.query(&sql)?;
-
-        // Build complete params list: filter params, top_k
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = filter_params;
-        params.push(Box::new(top_k as i64));
-
-        let param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-
-        let results = scored_documents_query
-            .query_map(param_refs.as_slice(), |row| {
-                Ok((
-                    row.get::<_, f32>(0)?,
-                    row.get::<_, u32>(1)?,
-                    row.get::<_, u32>(2)?,
-                ))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(results)
-    };
-    debug!(
-        "querying temp table took {} ms",
-        query_start.elapsed().as_millis()
-    );
-
-    db.execute("DROP TABLE temp2")?;
-
-    let results = match results_status {
-        Ok(results) => results,
-        Err(v) => {
-            warn!("scoring query failed {}", v);
-            [].into()
-        }
-    };
-
-    debug!("DB operations took {} ms total", now.elapsed().as_millis());
-    debug!(
-        "match_centroids internal total: {} ms.",
-        total_start.elapsed().as_millis()
-    );
-    Ok(results)
-}
-
-fn split_tensor(tensor: &Tensor) -> Vec<Tensor> {
-    let dims = tensor.dims();
-    let num_rows = dims[0];
-
-    // Collect each row as a separate Tensor of shape [EMBEDDING_DIM]
-    (0..num_rows)
-        .map(|i| {
-            let row_tensor = tensor.i(i).unwrap();
-            row_tensor.unsqueeze(0).unwrap()
-        })
-        .collect()
-}
-
-pub struct Gatherer<'a> {
-    documents: Box<dyn Iterator<Item = (String, String, String)> + 'a>,
-    embedder: &'a Embedder,
-}
-
-impl<'a> Gatherer<'a> {
-    fn new(stmt: &'a mut Statement, embedder: &'a Embedder) -> Self {
-        let documents = Box::new(
-            stmt.query_map((), |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .unwrap()
-            .map(Result::unwrap),
-        );
-
-        Self {
-            documents,
-            embedder,
-        }
-    }
-}
-
-impl<'a> Iterator for Gatherer<'a> {
-    type Item = (String, Tensor, Vec<u32>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.documents.next() {
-            Some((hash, body, lens)) => {
-                let now = std::time::Instant::now();
-                let (embeddings, offsets) = self.embedder.embed(&body).unwrap();
-                let embeddings = embeddings
-                    .squeeze(0)
-                    .unwrap()
-                    .to_device(&Device::Cpu)
-                    .unwrap();
-                let (m, _n) = embeddings.dims2().unwrap();
-                let dt = now.elapsed().as_secs_f64();
-                debug!(
-                    "embedder took {} ms ({} rows/s).",
-                    now.elapsed().as_millis(),
-                    ((m as f64) / dt).round()
-                );
-
-                let mut lengths: Vec<usize> = lens
-                    .split(',')
-                    .filter_map(|s| s.parse::<usize>().ok())
-                    .collect();
-                for i in 1..lengths.len() {
-                    lengths[i] += lengths[i - 1];
-                }
-
-                let mut i = 0;
-                let mut j = 0;
-
-                let i_end = offsets.len();
-                let j_end = lengths.len();
-                let mut count: u32 = 0;
-                let mut done = false;
-                let mut flush = false;
-                let mut counts = vec![];
-
-                while !done {
-                    let o = if i < offsets.len() {
-                        offsets[i].1
-                    } else {
-                        usize::MAX
-                    };
-
-                    let l = if j < lengths.len() {
-                        lengths[j]
-                    } else {
-                        usize::MAX
-                    };
-
-                    if o <= l {
-                        i += 1;
-                        count += 1;
-                    } else {
-                        j += 1;
-                        flush = true;
-                    }
-
-                    done = i == i_end && j == j_end;
-
-                    if flush || done {
-                        counts.push(count);
-                        count = 0;
-                        flush = false;
-                    }
-                }
-                assert!(count == 0);
-                assert!(counts.iter().sum::<u32>() == offsets.len() as u32);
-                Some((hash, embeddings, counts))
-            }
-            None => None,
-        }
-    }
-}
-
-#[cfg(debug_assertions)]
-fn rowwise_cosine_min(a: &Tensor, b: &Tensor) -> Result<f32> {
-    let (rows, cols) = a.dims2()?;
-    assert_eq!(b.dims2()?, (rows, cols));
-
-    let dot = (a * b)?.sum(1)?;
-    let norm_a = a.sqr()?.sum(1)?.sqrt()?;
-    let norm_b = b.sqr()?.sum(1)?.sqrt()?;
-    let denom = (&norm_a * &norm_b)?;
-    let cos = (&dot / &denom)?;
-    Ok(cos.min_all()?.to_scalar::<f32>()?)
-}
-
-#[cfg(debug_assertions)]
-fn stretch_rows(a: &Tensor) -> Result<Tensor> {
-    let device = a.device();
-    let (m, n) = a.dims2()?;
-
-    let mut scaled_rows = Vec::with_capacity(m);
-
-    for i in 0..m {
-        let row = a.get(i)?;
-        let v = row.to_vec1::<f32>()?;
-
-        let mut max = f32::MIN;
-        for x in &v {
-            let a = (*x).abs();
-            max = if a > max { a } else { max };
-        }
-        let range = max + 1e-6;
-        let scale = 1.0 / range;
-
-        let v2: Vec<f32> = v.iter().map(|x| scale * x).collect();
-
-        scaled_rows.push(Tensor::from_vec(v2, n, device)?);
-    }
-
-    Ok(Tensor::stack(&scaled_rows, 0)?)
-}
-
-pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Result<usize> {
-    let _priority_mgr = PriorityManager::new();
-
-    // Count total documents to embed for progress reporting
-    let mut progress = {
-        let count_sql = format!(
-            "SELECT COUNT(*) FROM document
-            LEFT JOIN chunk ON document.hash = chunk.hash
-            WHERE chunk.hash IS NULL
-            {}",
-            match limit {
-                Some(limit) => format!("LIMIT {limit}"),
-                _ => String::new(),
-            }
-        );
-        let mut count_query = db.query(&count_sql)?;
-        let total: usize = count_query.query_row((), |row| row.get::<_, usize>(0))?;
-        ProgressReporter::new("embed", total)
-    };
-
-    let sql = format!(
-        "SELECT
-        document.hash,document.body,document.lens
-        FROM document
-        LEFT JOIN chunk ON document.hash = chunk.hash
-        WHERE chunk.hash IS NULL
-        ORDER BY document.hash
-        {}",
-        match limit {
-            Some(limit) => format!("LIMIT {limit}"),
-            _ => String::new(),
-        }
-    );
-    let mut query = db.query(&sql)?;
-
-    let embedding_iter = Gatherer::new(&mut query, embedder);
-    let mut count = 0;
-    for (hash, embeddings, counts) in embedding_iter {
-        debug!(
-            "got embedding for chunk with hash {} {:?} {:?}",
-            hash,
-            embeddings.dims2()?,
-            counts,
-        );
-
-        let now = std::time::Instant::now();
-        let bytes = embeddings.embeddings_to_packed()?;
-        let (rows, cols) = embeddings.dims2()?;
-        let pct = 100.0 * (bytes.len() as f32) / ((rows * cols) as f32);
-        let bpe = 8.0 * (bytes.len() as f32) / ((rows * cols) as f32);
-        debug!(
-            "compressing to {pct:.2}% {bpe:.2}bpe took {} ms.",
-            now.elapsed().as_millis()
-        );
-
-        #[cfg(debug_assertions)]
-        {
-            let t = Tensor::embeddings_from_packed(&bytes, EMBEDDING_DIM, &Device::Cpu)?;
-            let min_acc = rowwise_cosine_min(&embeddings, &t)?;
-
-            let n = bpe.ceil() as u32;
-            let qn = stretch_rows(&embeddings)?.quantize(n)?.dequantize(n)?;
-            let min_qn_acc = rowwise_cosine_min(&embeddings, &qn)?;
-            println!("haar reconstruction accuracy={min_acc} compare at q{n}_acc={min_qn_acc}");
-        }
-
-        let counts = counts
-            .iter()
-            .map(|c| c.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-
-        match db.add_chunk(&hash, "xtr-base-en", &bytes, &counts) {
-            Ok(()) => {
-                count += 1;
-                progress.inc(1);
-            }
-            Err(v) => {
-                warn!("add_chunk failed {}", v);
-                break;
-            }
-        };
-    }
-    progress.finish();
-
-    debug!("embedded {count} chunks");
-    if count > 0 {
-        db.checkpoint();
-    }
-    Ok(count)
-}
-
-pub fn count_unindexed_embeddings(db: &DB) -> Result<usize> {
-    let mut unindexed_chunks_query = db.query(&format!(
-        "SELECT IFNULL(SUM(length(c.embeddings)), 0)/{EMBEDDING_DIM} AS total
-        FROM chunk AS c
-        LEFT JOIN indexed_chunk AS i
-        ON i.chunkid = c.rowid
-        WHERE i.chunkid IS NULL"
-    ))?;
-
-    let count = unindexed_chunks_query.query_row((), |row| row.get::<_, usize>(0))?;
-    Ok(count)
-}
-
-fn count_indexed_embeddings(db: &DB) -> Result<usize> {
-    let count: usize = db
-        .query("SELECT IFNULL(SUM(length(residuals)/64), 0) FROM bucket")?
-        .query_row((), |row| row.get::<_, usize>(0))?;
-    Ok(count)
-}
-
-fn count_buckets(db: &DB) -> Result<usize> {
-    let count: usize = db
-        .query("SELECT COUNT(*) FROM bucket")?
-        .query_row((), |row| row.get::<_, usize>(0))?;
-    Ok(count)
-}
-
-fn sample_embeddings_for_kmeans(db: &DB, sql: &str, device: &Device) -> Result<(Tensor, usize)> {
-    let mut kmeans_query = db.query(sql)?;
-    let mut total_embeddings = 0;
-    let mut rng = rand::rng();
-    let mut all_embeddings = vec![];
-    for embeddings in kmeans_query.query_map((), |row| row.get::<_, Vec<u8>>(0))? {
-        let t = Tensor::embeddings_from_packed(&embeddings?, EMBEDDING_DIM, &Device::Cpu)?;
-        let (m, _) = t.dims2()?;
-        let k = ((m as f32).sqrt().ceil()) as usize;
-        let subset_idx = rand::seq::index::sample(&mut rng, m, k).into_vec();
-        for i in subset_idx {
-            let row = t.get(i)?;
-            all_embeddings.push(row);
-        }
-        total_embeddings += m;
-    }
-    let matrix = Tensor::stack(&all_embeddings, 0)?.to_device(device)?;
-    Ok((matrix, total_embeddings))
-}
-
-fn run_kmeans_for_index(matrix: &Tensor, total_embeddings: usize) -> Result<Tensor> {
-    let now = std::time::Instant::now();
-    let mut k = (16.0 * (total_embeddings as f64).sqrt()).round() as usize;
-    k = k.max(1);
-    debug!("total_embeddings={} k={}", total_embeddings, k);
-    let (m, _) = matrix.dims2()?;
-    if m < k {
-        k = m / 4;
-    }
-    let centers = kmeans(matrix, k, 5)?;
-    debug!("kmeans took {} ms.", now.elapsed().as_millis());
-    Ok(centers)
-}
-
-pub fn full_index(db: &DB, device: &Device) -> Result<()> {
-    debug!("read all embeddings for full index...");
-    let (matrix, total_embeddings) =
-        sample_embeddings_for_kmeans(db, "SELECT chunk.embeddings FROM chunk", device)?;
-
-    let centers = run_kmeans_for_index(&matrix, total_embeddings)?;
-
-    debug!("write buckets (full)...");
-    let now = std::time::Instant::now();
-    let (tmpfiles, all_chunkids, centers_cpu) = write_buckets(
-        db,
-        &centers,
-        device,
-        IndexMode::Full,
-        total_embeddings as u64,
-    )?;
-    info!(
-        "write buckets (full) took {} ms.",
-        now.elapsed().as_millis()
-    );
-
-    let txstatus = match db.begin_transaction() {
-        Ok(()) => {
-            db.execute("DELETE FROM bucket")?;
-            db.execute("DELETE FROM indexed_chunk")?;
-            merge_and_write_buckets(db, tmpfiles, &all_chunkids, &centers_cpu, 0)?;
-            Ok(())
-        }
-        Err(v) => {
-            warn!("unable to begin transaction, index not created/updated! {v}");
-            Err(v)
-        }
-    };
-    match txstatus {
-        Ok(()) => {
-            db.commit_transaction()?;
-            invalidate_center_cache();
-            Ok(())
-        }
-        Err(v) => {
-            warn!("failure during indexing transaction {v}");
-            let _ = db.rollback_transaction();
-            Err(v.into())
-        }
-    }
-}
-
-fn incremental_index(db: &DB, device: &Device) -> Result<()> {
-    debug!("read unindexed embeddings for incremental index...");
-    let kmeans_sql = "SELECT c.embeddings FROM chunk AS c
-        WHERE NOT EXISTS (SELECT 1 FROM indexed_chunk AS i WHERE i.chunkid = c.rowid)";
-    let (matrix, total_embeddings) = sample_embeddings_for_kmeans(db, kmeans_sql, device)?;
-
-    let centers = run_kmeans_for_index(&matrix, total_embeddings)?;
-
-    debug!("write buckets (incremental)...");
-    let now = std::time::Instant::now();
-    let (tmpfiles, all_chunkids, centers_cpu) = write_buckets(
-        db,
-        &centers,
-        device,
-        IndexMode::Incremental,
-        total_embeddings as u64,
-    )?;
-    info!(
-        "write buckets (incremental) took {} ms.",
-        now.elapsed().as_millis()
-    );
-
-    let txstatus = match db.begin_transaction() {
-        Ok(()) => {
-            let max_bucket_id: i64 = db
-                .query("SELECT IFNULL(MAX(id), -1) FROM bucket")?
-                .query_row((), |row| row.get(0))?;
-            let id_offset = (max_bucket_id + 1) as u32;
-
-            merge_and_write_buckets(db, tmpfiles, &all_chunkids, &centers_cpu, id_offset)?;
-            Ok(())
-        }
-        Err(v) => {
-            warn!("unable to begin transaction, index not created/updated! {v}");
-            Err(v)
-        }
-    };
-    match txstatus {
-        Ok(()) => {
-            db.commit_transaction()?;
-            invalidate_center_cache();
-            Ok(())
-        }
-        Err(v) => {
-            warn!("failure during indexing transaction {v}");
-            let _ = db.rollback_transaction();
-            Err(v.into())
-        }
-    }
-}
-
-pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
-    let unindexed = count_unindexed_embeddings(db)?;
-    if unindexed == 0 {
-        return Ok(());
-    }
-
-    let indexed = count_indexed_embeddings(db)?;
-    let total_buckets = count_buckets(db)?;
-    let expected_k = (16.0 * ((indexed + unindexed) as f64).sqrt()).round() as usize;
-
-    info!(
-        "database has {} unindexed embeddings ({} indexed, {} buckets, ~{} expected)",
-        unindexed, indexed, total_buckets, expected_k
-    );
-
-    let result = if indexed == 0 || unindexed > indexed / 2 || total_buckets > expected_k * 10 {
-        full_index(db, device)
-    } else {
-        incremental_index(db, device)
-    };
-    if result.is_ok() {
-        db.checkpoint();
-    }
-    result
-}
-
+use arrow_array::builder::{
+    Float32Builder, Float64Builder, LargeStringBuilder, ListBuilder, StringBuilder, UInt32Builder,
+};
+use arrow_array::builder::{BooleanBuilder, FixedSizeListBuilder};
+use arrow_array::RecordBatch;
+use arrow_schema::Schema;
+use candle_core::{Device, Tensor};
+use futures::TryStreamExt;
+use lancedb::index::scalar::{BTreeIndexBuilder, FtsIndexBuilder, FullTextSearchQuery};
+use lancedb::query::{ExecutableQuery, QueryBase, Select};
+use lancedb::DistanceType;
 use lru::LruCache;
-use std::num::NonZeroUsize;
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+pub const EMBEDDING_DIM: usize = 128;
+const HASH_CHARS: usize = 32;
+const TABLE_NAME: &str = "chunks";
+
+// ---------------------------------------------------------------------------
+// Device
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+pub fn make_device() -> Device {
+    Device::new_metal(0).unwrap_or(Device::Cpu)
+}
+
+#[cfg(not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")))]
+pub fn make_device() -> Device {
+    Device::Cpu
+}
+
+// ---------------------------------------------------------------------------
+// Embeddings Cache
+// ---------------------------------------------------------------------------
 
 pub struct EmbeddingsCache {
     cache: LruCache<String, Tensor>,
@@ -1526,128 +94,830 @@ pub struct EmbeddingsCache {
 
 impl EmbeddingsCache {
     pub fn new(capacity: usize) -> Self {
-        let cap = NonZeroUsize::new(capacity.max(1)).unwrap();
         Self {
-            cache: LruCache::new(cap),
+            cache: LruCache::new(std::num::NonZeroUsize::new(capacity.max(1)).unwrap()),
         }
     }
 
-    pub fn get(&mut self, key: &String) -> Option<Tensor> {
+    pub fn get(&mut self, key: &str) -> Option<Tensor> {
         self.cache.get(key).cloned()
     }
 
-    pub fn put(&mut self, key: &String, value: &Tensor) {
+    pub fn put(&mut self, key: &str, value: &Tensor) {
         self.cache.put(key.into(), value.clone());
     }
 }
 
-pub fn search(
-    db: &DB,
-    embedder: &Embedder,
-    cache: &mut EmbeddingsCache,
-    q: &str,
-    threshold: f32,
-    top_k: usize,
-    use_fulltext: bool,
-    sql_filter: Option<&SqlStatementInternal>,
-) -> Result<Vec<(f32, String, Vec<String>, u32, String)>> {
-    let now = std::time::Instant::now();
+// ---------------------------------------------------------------------------
+// Content hashing (preserved from old db.rs)
+// ---------------------------------------------------------------------------
 
-    let q = q.split_whitespace().collect::<Vec<_>>().join(" ");
+fn content_hash(body: &str, lens: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(body.as_bytes());
+    hasher.update(lens.as_bytes());
+    let result = hasher.finalize();
+    let hex = format!("{:x}", result);
+    hex[..HASH_CHARS].to_string()
+}
 
-    let fts_matches = if use_fulltext {
-        fulltext_search(db, &q, top_k, sql_filter)?
-    } else {
-        vec![]
-    };
+// ---------------------------------------------------------------------------
+// String splitting by codepoints (preserved)
+// ---------------------------------------------------------------------------
 
-    let sem_matches = if q.len() > 3 {
-        let qe = match cache.get(&q) {
-            Some(existing) => existing,
-            None => {
-                let (qe, _) = embedder.embed(&q)?;
-                let qe = qe.get(0)?;
-                cache.put(&q, &qe);
-                qe
+pub fn split_by_codepoints<'a>(s: &'a str, lengths: &[usize]) -> Vec<&'a str> {
+    let mut boundaries: Vec<usize> = s.char_indices().map(|(i, _)| i).collect();
+    boundaries.push(s.len());
+
+    let char_len = boundaries.len() - 1;
+    let sum_chars: usize = lengths.iter().copied().sum();
+    if sum_chars != char_len {
+        warn!("sum of lengths does not match utf8-length of string!");
+        return vec![];
+    }
+
+    let mut parts = Vec::with_capacity(lengths.len());
+    let mut pos = 0usize;
+
+    for &chunk_chars in lengths {
+        let start_byte = boundaries[pos];
+        let end_pos = pos + chunk_chars;
+        let end_byte = boundaries[end_pos];
+        parts.push(&s[start_byte..end_byte]);
+        pos = end_pos;
+    }
+    parts
+}
+
+// ---------------------------------------------------------------------------
+// Reciprocal Rank Fusion (preserved, updated for new DocPtr type)
+// ---------------------------------------------------------------------------
+
+pub fn reciprocal_rank_fusion(list1: &[DocPtr], list2: &[DocPtr], k: f64) -> Vec<DocPtr> {
+    let mut scores: HashMap<DocPtr, f64> = HashMap::new();
+
+    for (rank, doc_id) in list1.iter().enumerate() {
+        let score = 1.0 / (3.0 + k + rank as f64);
+        *scores.entry(doc_id.clone()).or_insert(0.0) += score;
+    }
+
+    for (rank, doc_id) in list2.iter().enumerate() {
+        let score = 1.0 / (k + rank as f64);
+        *scores.entry(doc_id.clone()).or_insert(0.0) += score;
+    }
+
+    let mut results: Vec<(DocPtr, f64)> = scores.into_iter().collect();
+    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    results.into_iter().map(|(idx, _)| idx).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Embedding splitting: assign token embeddings to sub-chunks
+// ---------------------------------------------------------------------------
+
+/// Given token-level embeddings and their byte offsets, plus the sub-chunk
+/// codepoint lengths, split the token embeddings into groups per sub-chunk.
+///
+/// Returns a Vec of Vec<Vec<f32>> — one entry per sub-chunk, each containing
+/// the token embeddings (as flat f32 vecs) belonging to that sub-chunk.
+fn split_embeddings_by_chunks(
+    embeddings: &Tensor,
+    offsets: &[(usize, usize)],
+    body: &str,
+    lengths: &[usize],
+) -> Result<Vec<Vec<Vec<f32>>>> {
+    // Convert codepoint lengths to cumulative byte boundaries
+    let mut cum_lengths: Vec<usize> = lengths.to_vec();
+    for i in 1..cum_lengths.len() {
+        cum_lengths[i] += cum_lengths[i - 1];
+    }
+
+    let embeddings = embeddings.squeeze(0)?; // [N, 128]
+    let (num_tokens, _dim) = embeddings.dims2()?;
+
+    let mut result: Vec<Vec<Vec<f32>>> = vec![vec![]; lengths.len()];
+    let mut i = 0; // token index
+    let mut j = 0; // chunk index
+
+    // Convert codepoint cumulative lengths to byte boundaries
+    let mut char_boundaries: Vec<usize> = body.char_indices().map(|(idx, _)| idx).collect();
+    char_boundaries.push(body.len());
+
+    let byte_boundaries: Vec<usize> = cum_lengths
+        .iter()
+        .map(|&cp| {
+            if cp <= char_boundaries.len() - 1 {
+                char_boundaries[cp]
+            } else {
+                body.len()
             }
-        };
-        match match_centroids(db, &qe, threshold, top_k, sql_filter) {
-            Ok(result) => result,
-            Err(v) => {
-                warn!("match_centroids failed {v}");
-                vec![]
+        })
+        .collect();
+
+    while i < num_tokens && j < byte_boundaries.len() {
+        let token_end_byte = offsets[i].1;
+        let chunk_end_byte = byte_boundaries[j];
+
+        if token_end_byte <= chunk_end_byte {
+            let row = embeddings.get(i)?.to_vec1::<f32>()?;
+            result[j].push(row);
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    // Any remaining tokens go into the last chunk
+    while i < num_tokens {
+        let last = result.len() - 1;
+        let row = embeddings.get(i)?.to_vec1::<f32>()?;
+        result[last].push(row);
+        i += 1;
+    }
+
+    // Ensure every chunk has at least one embedding (use zero vector if needed)
+    for chunk_vecs in &mut result {
+        if chunk_vecs.is_empty() {
+            chunk_vecs.push(vec![0.0f32; EMBEDDING_DIM]);
+        }
+    }
+
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Arrow RecordBatch construction
+// ---------------------------------------------------------------------------
+
+fn build_record_batch(
+    schema: &Arc<Schema>,
+    metadata_schema: &MetadataSchema,
+    rows: &[SubChunkRow],
+) -> Result<RecordBatch> {
+    let mut doc_uuid_builder = StringBuilder::new();
+    let mut sub_idx_builder = UInt32Builder::new();
+    let mut date_builder = StringBuilder::new();
+    let mut body_builder = LargeStringBuilder::new();
+    let mut sub_body_builder = StringBuilder::new();
+    let mut lens_builder = StringBuilder::new();
+    let mut hash_builder = StringBuilder::new();
+
+    // Multivector builder: List<FixedSizeList<f32, 128>>
+    let inner_builder = FixedSizeListBuilder::new(Float32Builder::new(), EMBEDDING_DIM as i32);
+    let mut vectors_builder = ListBuilder::new(inner_builder);
+
+    // Metadata builders (one per field, in schema order)
+    let mut meta_string_builders: Vec<(String, StringBuilder)> = vec![];
+    let mut meta_number_builders: Vec<(String, Float64Builder)> = vec![];
+    let mut meta_bool_builders: Vec<(String, BooleanBuilder)> = vec![];
+
+    for f in &metadata_schema.fields {
+        match f.field_type {
+            MetadataFieldType::String => {
+                meta_string_builders.push((f.name.clone(), StringBuilder::new()));
+            }
+            MetadataFieldType::Number => {
+                meta_number_builders.push((f.name.clone(), Float64Builder::new()));
+            }
+            MetadataFieldType::Bool => {
+                meta_bool_builders.push((f.name.clone(), BooleanBuilder::new()));
             }
         }
-    } else {
-        vec![]
-    };
-
-    let mut scores: HashMap<DocPtr, f32> = HashMap::new();
-    let mut offsets: HashMap<DocPtr, u32> = HashMap::new();
-
-    for (score, idx, offset) in &fts_matches {
-        let key = (*idx, *offset);
-        scores.insert(key, *score);
-        offsets.insert(key, *offset);
-    }
-    for (score, idx, offset) in &sem_matches {
-        let key = (*idx, *offset);
-        scores.insert(key, *score);
-        offsets.insert(key, *offset);
     }
 
-    let sem_idxs: Vec<DocPtr> = sem_matches.iter().map(|&(_, idx, sub_idx)| (idx, sub_idx)).collect();
-    info!("semantic search found {} matches", sem_idxs.len());
+    for row in rows {
+        doc_uuid_builder.append_value(&row.doc_uuid);
+        sub_idx_builder.append_value(row.sub_idx);
+        date_builder.append_value(&row.date);
+        body_builder.append_value(&row.body);
+        sub_body_builder.append_value(&row.sub_body);
+        lens_builder.append_value(&row.lens);
+        hash_builder.append_value(&row.hash);
 
-    let mut fused = if use_fulltext {
-        let fts_idxs: Vec<DocPtr> = fts_matches.iter().map(|&(_, idx, sub_idx)| (idx, sub_idx)).collect();
-        reciprocal_rank_fusion(&fts_idxs, &sem_idxs, 60.0)
-    } else {
-        sem_idxs
-    };
-    fused.truncate(top_k);
+        // Build multivector: each token embedding is a FixedSizeList<f32, 128>
+        let fsl_builder = vectors_builder.values();
+        for token_vec in &row.vectors {
+            let vals_builder = fsl_builder.values();
+            for &v in token_vec {
+                vals_builder.append_value(v);
+            }
+            fsl_builder.append(true);
+        }
+        vectors_builder.append(true);
 
-    let mut results = vec![];
-    let mut body_query = db.query("SELECT metadata,body,lens,date FROM document WHERE rowid = ?1")?;
-    for (idx, sub_idx) in fused {
-        let tuple : DocPtr = (idx, sub_idx);
-        let score = match scores.get(&tuple) {
-            Some(score) => *score,
-            None => 0.0f32,
+        // Metadata columns
+        for (name, builder) in &mut meta_string_builders {
+            match row.metadata.get(name.as_str()) {
+                Some(MetadataValue::String(s)) => builder.append_value(s),
+                _ => builder.append_null(),
+            }
+        }
+        for (name, builder) in &mut meta_number_builders {
+            match row.metadata.get(name.as_str()) {
+                Some(MetadataValue::Number(n)) => builder.append_value(*n),
+                _ => builder.append_null(),
+            }
+        }
+        for (name, builder) in &mut meta_bool_builders {
+            match row.metadata.get(name.as_str()) {
+                Some(MetadataValue::Bool(b)) => builder.append_value(*b),
+                _ => builder.append_null(),
+            }
+        }
+    }
+
+    // Assemble columns in schema order
+    let mut columns: Vec<Arc<dyn arrow_array::Array>> = vec![
+        Arc::new(doc_uuid_builder.finish()),
+        Arc::new(sub_idx_builder.finish()),
+        Arc::new(date_builder.finish()),
+        Arc::new(body_builder.finish()),
+        Arc::new(sub_body_builder.finish()),
+        Arc::new(lens_builder.finish()),
+        Arc::new(hash_builder.finish()),
+        Arc::new(vectors_builder.finish()),
+    ];
+
+    // Add metadata columns in the same order as the schema
+    for f in &metadata_schema.fields {
+        match f.field_type {
+            MetadataFieldType::String => {
+                let (_, builder) = meta_string_builders
+                    .iter_mut()
+                    .find(|(n, _)| n == &f.name)
+                    .unwrap();
+                columns.push(Arc::new(builder.finish()));
+            }
+            MetadataFieldType::Number => {
+                let (_, builder) = meta_number_builders
+                    .iter_mut()
+                    .find(|(n, _)| n == &f.name)
+                    .unwrap();
+                columns.push(Arc::new(builder.finish()));
+            }
+            MetadataFieldType::Bool => {
+                let (_, builder) = meta_bool_builders
+                    .iter_mut()
+                    .find(|(n, _)| n == &f.name)
+                    .unwrap();
+                columns.push(Arc::new(builder.finish()));
+            }
+        }
+    }
+
+    Ok(RecordBatch::try_new(schema.clone(), columns)?)
+}
+
+/// Internal representation of a sub-chunk row before Arrow conversion.
+struct SubChunkRow {
+    doc_uuid: String,
+    sub_idx: u32,
+    date: String,
+    body: String,
+    sub_body: String,
+    lens: String,
+    hash: String,
+    vectors: Vec<Vec<f32>>, // token embeddings for this sub-chunk
+    metadata: HashMap<String, MetadataValue>,
+}
+
+// ---------------------------------------------------------------------------
+// Witchcraft: the main API struct
+// ---------------------------------------------------------------------------
+
+pub struct Witchcraft {
+    #[allow(dead_code)]
+    db: lancedb::Connection,
+    table: lancedb::Table,
+    embedder: Embedder,
+    cache: EmbeddingsCache,
+    metadata_schema: MetadataSchema,
+    arrow_schema: Arc<Schema>,
+}
+
+impl Witchcraft {
+    /// Open or create a Witchcraft database at the given path.
+    ///
+    /// If the table does not exist, it is created with the given schema.
+    /// The `assets` path should point to the T5 model weights directory.
+    pub async fn new(
+        path: impl AsRef<Path>,
+        assets: impl AsRef<Path>,
+        metadata_schema: MetadataSchema,
+    ) -> Result<Self> {
+        let device = make_device();
+        let embedder = Embedder::new(&device, assets.as_ref())?;
+        let db = lancedb::connect(path.as_ref().to_str().unwrap())
+            .execute()
+            .await?;
+
+        let arrow_schema = schema::build_arrow_schema(&metadata_schema);
+        let table = match db.open_table(TABLE_NAME).execute().await {
+            Ok(t) => t,
+            Err(_) => {
+                db.create_empty_table(TABLE_NAME, arrow_schema.clone())
+                    .execute()
+                    .await?
+            }
         };
-        let (metadata, bodies, date) = body_query.query_row((idx,), |row| {
-            let (metadata, body, lens, date) = (
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            );
-            let lens: Vec<usize> = lens
-                .split(',')
-                .map(|x| x.parse::<usize>().unwrap())
-                .collect();
-            let bodies: Vec<String> = split_by_codepoints(&body, &lens)
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect();
-            Ok((metadata, bodies, date))
-        })?;
 
-        let sub = (sub_idx as usize).min(bodies.len().saturating_sub(1)) as u32;
-        results.push((score, metadata, bodies, sub, date));
+        Ok(Self {
+            db,
+            table,
+            embedder,
+            cache: EmbeddingsCache::new(32),
+            metadata_schema,
+            arrow_schema,
+        })
     }
 
-    let mut max = -1.0f32;
-    for (score, _, _, _, _) in results.iter_mut().rev() {
-        max = max.max(*score);
-        *score = max;
+    /// Get a reference to the underlying LanceDB table for direct queries.
+    pub fn table_ref(&self) -> &lancedb::Table {
+        &self.table
     }
 
-    debug!(
-        "witchcraft search took {} ms end-to-end.",
-        now.elapsed().as_millis()
-    );
-    Ok(results)
+    /// Open read-only (no embedder needed if only searching with cached index).
+    pub async fn open(
+        path: impl AsRef<Path>,
+        assets: impl AsRef<Path>,
+        metadata_schema: MetadataSchema,
+    ) -> Result<Self> {
+        // For now, always create an embedder (needed for query embedding).
+        Self::new(path, assets, metadata_schema).await
+    }
+
+    // -----------------------------------------------------------------------
+    // Document operations
+    // -----------------------------------------------------------------------
+
+    /// Add a document, embedding it immediately and writing sub-chunk rows.
+    pub async fn add_document(
+        &mut self,
+        uuid: &Uuid,
+        date: Option<&str>,
+        metadata: HashMap<String, MetadataValue>,
+        body: &str,
+        lens: Option<Vec<usize>>,
+    ) -> Result<()> {
+        let date_str = date.unwrap_or("").to_string();
+
+        let lengths = match lens {
+            Some(l) => l,
+            None => vec![body.chars().count()],
+        };
+        let lens_str: String = lengths
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        let hash = content_hash(body, &lens_str);
+
+        // Content-addressable dedup: skip if hash already exists
+        let existing = self
+            .table
+            .query()
+            .only_if(format!("hash = '{}'", hash))
+            .limit(1)
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        if !existing.is_empty() {
+            debug!("skipping duplicate content hash {}", hash);
+            return Ok(());
+        }
+
+        // Embed the full body
+        let (embeddings_tensor, offsets) = self.embedder.embed(body)?;
+
+        // Split embeddings into per-sub-chunk groups
+        let chunk_embeddings =
+            split_embeddings_by_chunks(&embeddings_tensor, &offsets, body, &lengths)?;
+
+        // Split body text into sub-chunks
+        let sub_bodies = split_by_codepoints(body, &lengths);
+
+        // Build rows
+        let mut rows = Vec::with_capacity(lengths.len());
+        for (i, (sub_body, vectors)) in sub_bodies.iter().zip(chunk_embeddings).enumerate() {
+            rows.push(SubChunkRow {
+                doc_uuid: uuid.to_string(),
+                sub_idx: i as u32,
+                date: date_str.clone(),
+                body: body.to_string(),
+                sub_body: sub_body.to_string(),
+                lens: lens_str.clone(),
+                hash: hash.clone(),
+                vectors,
+                metadata: metadata.clone(),
+            });
+        }
+
+        let batch = build_record_batch(&self.arrow_schema, &self.metadata_schema, &rows)?;
+        self.table.add(batch).execute().await?;
+
+        debug!(
+            "added document {} with {} sub-chunks",
+            uuid,
+            rows.len()
+        );
+        Ok(())
+    }
+
+    /// Remove all rows for a given document UUID.
+    pub async fn remove_document(&mut self, uuid: &Uuid) -> Result<()> {
+        self.table
+            .delete(&format!("doc_uuid = '{}'", uuid))
+            .await?;
+        Ok(())
+    }
+
+    /// Delete documents matching a filter.
+    pub async fn delete_with_filter(&mut self, filter: &Filter) -> Result<()> {
+        let filter_str = filter.to_lance_filter();
+        if filter_str.is_empty() {
+            self.clear().await?;
+        } else {
+            self.table.delete(&filter_str).await?;
+        }
+        Ok(())
+    }
+
+    /// Clear all data.
+    pub async fn clear(&mut self) -> Result<()> {
+        self.table.delete("true").await?;
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Index management
+    // -----------------------------------------------------------------------
+
+    /// Build vector + FTS + scalar indexes.
+    ///
+    /// Call after bulk ingestion. LanceDB handles the IVF construction
+    /// internally -- this replaces the entire kmeans/bucket pipeline.
+    pub async fn build_index(&mut self) -> Result<()> {
+        info!("building vector index (IVF_PQ with cosine)...");
+        // Vector index on multivector column
+        self.table
+            .create_index(
+                &["vectors"],
+                lancedb::index::Index::Auto,
+            )
+            .execute()
+            .await?;
+
+        info!("building FTS index on sub_body...");
+        self.table
+            .create_index(
+                &["sub_body"],
+                lancedb::index::Index::FTS(FtsIndexBuilder::default()),
+            )
+            .execute()
+            .await?;
+
+        // Scalar indexes on indexed metadata columns
+        for field in &self.metadata_schema.fields {
+            if field.indexed {
+                info!("building scalar index on {}...", field.name);
+                self.table
+                    .create_index(
+                        &[&field.name],
+                        lancedb::index::Index::BTree(BTreeIndexBuilder::default()),
+                    )
+                    .execute()
+                    .await?;
+            }
+        }
+
+        info!("all indexes built successfully");
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Search
+    // -----------------------------------------------------------------------
+
+    /// Hybrid search combining multivector semantic search and FTS with RRF fusion.
+    pub async fn search(
+        &mut self,
+        query: &str,
+        _threshold: f32,
+        top_k: usize,
+        use_fulltext: bool,
+        filter: Option<&Filter>,
+    ) -> Result<Vec<SearchResult>> {
+        let now = std::time::Instant::now();
+        let q = query.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let filter_str = filter.map(|f| f.to_lance_filter()).unwrap_or_default();
+
+        // -- Semantic search via LanceDB multivector --
+        let sem_matches = if q.len() > 3 {
+            let qe = match self.cache.get(&q) {
+                Some(existing) => existing,
+                None => {
+                    let (qe, _) = self.embedder.embed(&q)?;
+                    let qe = qe.get(0)?;
+                    self.cache.put(&q, &qe);
+                    qe
+                }
+            };
+
+            self.semantic_search(&qe, top_k * 2, &filter_str).await?
+        } else {
+            vec![]
+        };
+
+        // -- Full-text search --
+        let fts_matches = if use_fulltext {
+            self.fulltext_search(&q, top_k * 2, &filter_str).await?
+        } else {
+            vec![]
+        };
+
+        // -- Fusion --
+        let sem_ptrs: Vec<DocPtr> = sem_matches
+            .iter()
+            .map(|(ptr, _)| ptr.clone())
+            .collect();
+        info!("semantic search found {} matches", sem_ptrs.len());
+
+        let mut all_scores: HashMap<DocPtr, f32> = HashMap::new();
+        for (ptr, score) in &sem_matches {
+            all_scores.insert(ptr.clone(), *score);
+        }
+        for (ptr, score) in &fts_matches {
+            all_scores.insert(ptr.clone(), *score);
+        }
+
+        let mut fused = if use_fulltext {
+            let fts_ptrs: Vec<DocPtr> = fts_matches
+                .iter()
+                .map(|(ptr, _)| ptr.clone())
+                .collect();
+            reciprocal_rank_fusion(&fts_ptrs, &sem_ptrs, 60.0)
+        } else {
+            sem_ptrs
+        };
+        fused.truncate(top_k);
+
+        // -- Assemble results --
+        // We need to fetch full document data for each result.
+        // The data is already in the table rows, so we query for each hit.
+        let mut results = Vec::with_capacity(fused.len());
+        for (doc_uuid, sub_idx) in &fused {
+            let score = all_scores
+                .get(&(doc_uuid.clone(), *sub_idx))
+                .copied()
+                .unwrap_or(0.0);
+
+            // Fetch the full row data
+            let row_filter = format!("doc_uuid = '{}' AND sub_idx = {}", doc_uuid, sub_idx);
+            let batches = self
+                .table
+                .query()
+                .only_if(&row_filter)
+                .select(Select::Columns(vec![
+                    "body".to_string(),
+                    "lens".to_string(),
+                    "date".to_string(),
+                ]))
+                .limit(1)
+                .execute()
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?;
+
+            if let Some(batch) = batches.first() {
+                if batch.num_rows() > 0 {
+                    let body_col = batch
+                        .column_by_name("body")
+                        .and_then(|c| c.as_any().downcast_ref::<arrow_array::LargeStringArray>());
+                    let lens_col = batch
+                        .column_by_name("lens")
+                        .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>());
+                    let date_col = batch
+                        .column_by_name("date")
+                        .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>());
+
+                    if let (Some(body_arr), Some(lens_arr), Some(date_arr)) =
+                        (body_col, lens_col, date_col)
+                    {
+                        let body = body_arr.value(0);
+                        let lens_str = lens_arr.value(0);
+                        let date = date_arr.value(0).to_string();
+
+                        let lens: Vec<usize> = lens_str
+                            .split(',')
+                            .filter_map(|s| s.parse::<usize>().ok())
+                            .collect();
+                        let bodies: Vec<String> = split_by_codepoints(body, &lens)
+                            .into_iter()
+                            .map(|s| s.to_string())
+                            .collect();
+
+                        let sub = (*sub_idx as usize).min(bodies.len().saturating_sub(1)) as u32;
+
+                        let meta = HashMap::new();
+
+                        results.push(SearchResult {
+                            score,
+                            metadata: meta,
+                            bodies,
+                            matched_sub_idx: sub,
+                            date,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Ensure monotonically non-increasing scores
+        let mut max = -1.0f32;
+        for r in results.iter_mut().rev() {
+            max = max.max(r.score);
+            r.score = max;
+        }
+
+        debug!(
+            "witchcraft search took {} ms end-to-end.",
+            now.elapsed().as_millis()
+        );
+        Ok(results)
+    }
+
+    /// Multivector semantic search via LanceDB.
+    ///
+    /// Each query token embedding is passed as a separate query vector using
+    /// `nearest_to()` + `add_query_vector()`. LanceDB dispatches this as a
+    /// multivector (MaxSim/late-interaction) search against the `vectors` column
+    /// which stores `List<FixedSizeList<f32, 128>>` per sub-chunk.
+    async fn semantic_search(
+        &self,
+        query_embeddings: &Tensor,
+        limit: usize,
+        filter_str: &str,
+    ) -> Result<Vec<(DocPtr, f32)>> {
+        let (num_tokens, _dim) = query_embeddings.dims2()?;
+
+        // Convert query tensor to per-token Vec<f32> for LanceDB multivector query
+        let mut query_vecs: Vec<Vec<f32>> = Vec::with_capacity(num_tokens);
+        for i in 0..num_tokens {
+            let row = query_embeddings.get(i)?.to_vec1::<f32>()?;
+            query_vecs.push(row);
+        }
+
+        // Build multivector query: first token via nearest_to, rest via add_query_vector
+        // This triggers LanceDB's multivector (MaxSim) scoring against the
+        // List<FixedSizeList<f32, 128>> column.
+        let first = query_vecs[0].clone();
+        let mut qb = self
+            .table
+            .query()
+            .nearest_to(first)?
+            .column("vectors")
+            .distance_type(DistanceType::Cosine)
+            .limit(limit);
+
+        for token_vec in &query_vecs[1..] {
+            qb = qb.add_query_vector(token_vec.clone())?;
+        }
+
+        if !filter_str.is_empty() {
+            qb = qb.only_if(filter_str);
+        }
+
+        let batches = qb
+            .select(Select::Columns(vec![
+                "doc_uuid".to_string(),
+                "sub_idx".to_string(),
+                "_distance".to_string(),
+            ]))
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut results = Vec::new();
+        for batch in &batches {
+            let uuid_col = batch
+                .column_by_name("doc_uuid")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>());
+            let idx_col = batch
+                .column_by_name("sub_idx")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt32Array>());
+            let dist_col = batch
+                .column_by_name("_distance")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::Float32Array>());
+
+            if let (Some(uuids), Some(idxs), Some(dists)) = (uuid_col, idx_col, dist_col) {
+                for i in 0..batch.num_rows() {
+                    let uuid = uuids.value(i).to_string();
+                    let sub_idx = idxs.value(i);
+                    let distance = dists.value(i);
+                    // Convert cosine distance to similarity score (1 - distance)
+                    let score = 1.0 - distance;
+                    results.push(((uuid, sub_idx), score));
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Full-text search via LanceDB FTS index.
+    async fn fulltext_search(
+        &self,
+        query: &str,
+        limit: usize,
+        filter_str: &str,
+    ) -> Result<Vec<(DocPtr, f32)>> {
+        // Sanitize query to alphanumeric + whitespace
+        let sanitized: String = query
+            .chars()
+            .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+            .collect();
+
+        if sanitized.trim().is_empty() {
+            return Ok(vec![]);
+        }
+
+        let fts_query = FullTextSearchQuery::new(sanitized.clone());
+        let mut qb = self.table.query().full_text_search(fts_query).limit(limit);
+
+        if !filter_str.is_empty() {
+            qb = qb.only_if(filter_str);
+        }
+
+        let batches = qb
+            .select(Select::Columns(vec![
+                "doc_uuid".to_string(),
+                "sub_idx".to_string(),
+                "sub_body".to_string(),
+            ]))
+            .execute()
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mut results = Vec::new();
+        for batch in &batches {
+            let uuid_col = batch
+                .column_by_name("doc_uuid")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>());
+            let idx_col = batch
+                .column_by_name("sub_idx")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt32Array>());
+            let body_col = batch
+                .column_by_name("sub_body")
+                .and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>());
+
+            if let (Some(uuids), Some(idxs), Some(bodies)) = (uuid_col, idx_col, body_col) {
+                for i in 0..batch.num_rows() {
+                    let uuid = uuids.value(i).to_string();
+                    let sub_idx = idxs.value(i);
+                    let sub_body = bodies.value(i);
+                    // Score with Jaro-Winkler similarity (same as original)
+                    let score = strsim::jaro_winkler(&sanitized, sub_body) as f32;
+                    results.push(((uuid, sub_idx), score));
+                }
+            }
+        }
+
+        info!("full text found {} matches", results.len());
+        Ok(results)
+    }
+
+    // -----------------------------------------------------------------------
+    // Scoring (no DB needed)
+    // -----------------------------------------------------------------------
+
+    /// Score a list of sentences against a query using the embedding model.
+    ///
+    /// Returns a score per sentence (higher = more relevant).
+    pub fn score_sentences(
+        &mut self,
+        query: &str,
+        sentences: &[String],
+    ) -> Result<Vec<f32>> {
+        score_query_sentences(&self.embedder, &mut self.cache, &query.to_string(), sentences)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Standalone scoring function (no DB needed)
+// ---------------------------------------------------------------------------
+
+fn split_tensor(tensor: &Tensor) -> Vec<Tensor> {
+    let num_rows = tensor.dim(0).unwrap();
+    (0..num_rows)
+        .map(|i| {
+            let row_tensor = tensor.get(i).unwrap();
+            row_tensor.unsqueeze(0).unwrap()
+        })
+        .collect()
 }
 
 pub fn score_query_sentences(
@@ -1661,7 +931,6 @@ pub fn score_query_sentences(
         Some(existing) => existing,
         None => {
             let (qe, _offsets) = embedder.embed(q)?;
-
             qe.get(0)?
         }
     };
@@ -1696,51 +965,6 @@ pub fn score_query_sentences(
         now.elapsed().as_millis()
     );
     Ok(scores)
-}
-
-pub fn split_by_codepoints<'a>(s: &'a str, lengths: &[usize]) -> Vec<&'a str> {
-    // Precompute byte indices of every char boundary: [0, b1, b2, ..., s.len()]
-    let mut boundaries: Vec<usize> = s.char_indices().map(|(i, _)| i).collect();
-    boundaries.push(s.len());
-
-    let char_len = boundaries.len() - 1;
-    let sum_chars: usize = lengths.iter().copied().sum();
-    if sum_chars != char_len {
-        warn!("sum of lengths does not match utf8-length of string!");
-        return vec![];
-    }
-
-    let mut parts = Vec::with_capacity(lengths.len());
-    let mut pos = 0usize; // index into `boundaries` (in chars)
-
-    for &chunk_chars in lengths {
-        let start_byte = boundaries[pos];
-        let end_pos = pos + chunk_chars;
-        let end_byte = boundaries[end_pos];
-        // Slicing on these byte indices is always valid by construction.
-        parts.push(&s[start_byte..end_byte]);
-        pos = end_pos;
-    }
-    parts
-}
-
-#[test]
-fn test_compress_decompress_keys_roundtrip() {
-    let test_cases = vec![
-        vec![],
-        vec![(1, 1)],
-        vec![(1, 1), (1, 3), (2, 0), (2, 1)],
-        vec![(10, 0), (10, 1), (10, 2), (11, 0)],
-        vec![(1, 2), (1, 2), (1, 2), (2, 2)],
-        vec![(0, 0)],
-        vec![],
-    ];
-
-    for original in test_cases {
-        let compressed = compress_keys(&original);
-        let decompressed = decompress_keys(&compressed).unwrap();
-        assert_eq!(original, decompressed);
-    }
 }
 
 #[cfg(test)]

@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use text_splitter::MarkdownSplitter;
 use uuid::Uuid;
 
-use witchcraft::DB;
+use std::collections::HashMap;
+use witchcraft::{MetadataValue, Witchcraft};
 
 const MIN_CHUNK_CODEPOINTS: usize = 5;
 const MAX_CHUNK_CODEPOINTS: usize = 4000;
@@ -254,7 +255,7 @@ fn decode_project_name(dir_name: &str) -> String {
     dir_name.replace('-', "/").trim_start_matches('/').to_string()
 }
 
-fn ingest_session(db: &mut DB, path: &Path, project_name: &str, mtime_ms: i64) -> Result<usize> {
+async fn ingest_session(wc: &mut Witchcraft, path: &Path, project_name: &str, mtime_ms: i64) -> Result<usize> {
     let chunks = parse_session_file(path);
     if chunks.is_empty() {
         return Ok(0);
@@ -315,25 +316,22 @@ fn ingest_session(db: &mut DB, path: &Path, project_name: &str, mtime_ms: i64) -
             format!("{session_id}:{turn_idx}").as_bytes(),
         );
 
-        let metadata = serde_json::json!({
-            "project": project_name,
-            "session_id": session_id.to_string(),
-            "turn": turn_idx,
-            "path": path.to_string_lossy(),
-            "mtime_ms": mtime_ms,
-            "turns": turns_meta,
-        })
-        .to_string();
+        let mut metadata = HashMap::new();
+        metadata.insert("project".to_string(), MetadataValue::String(project_name.to_string()));
+        metadata.insert("session_id".to_string(), MetadataValue::String(session_id.to_string()));
+        metadata.insert("turn".to_string(), MetadataValue::Number(turn_idx as f64));
+        metadata.insert("path".to_string(), MetadataValue::String(path.to_string_lossy().to_string()));
+        metadata.insert("source".to_string(), MetadataValue::String("claude".to_string()));
 
-        let date = iso8601_timestamp::Timestamp::parse(&interaction[0].timestamp);
-        db.add_doc(&uuid, date, &metadata, &body, Some(lengths))?;
+        let date_str = &interaction[0].timestamp;
+        wc.add_document(&uuid, Some(date_str), metadata, &body, Some(lengths)).await?;
         count += 1;
     }
 
     Ok(count)
 }
 
-fn ingest_memory_file(db: &mut DB, path: &Path, project_name: &str, mtime_ms: i64) -> Result<bool> {
+async fn ingest_memory_file(wc: &mut Witchcraft, path: &Path, project_name: &str, mtime_ms: i64) -> Result<bool> {
     let raw = fs::read_to_string(path)?;
     if raw.trim().is_empty() {
         return Ok(false);
@@ -366,14 +364,12 @@ fn ingest_memory_file(db: &mut DB, path: &Path, project_name: &str, mtime_ms: i6
         return Ok(false);
     }
 
-    let metadata = serde_json::json!({
-        "project": project_name,
-        "path": path.to_string_lossy(),
-        "mtime_ms": mtime_ms,
-    })
-    .to_string();
+    let mut metadata = HashMap::new();
+    metadata.insert("project".to_string(), MetadataValue::String(project_name.to_string()));
+    metadata.insert("path".to_string(), MetadataValue::String(path.to_string_lossy().to_string()));
+    metadata.insert("source".to_string(), MetadataValue::String("claude".to_string()));
 
-    db.add_doc(&uuid, None, &metadata, &body, Some(lengths))?;
+    wc.add_document(&uuid, None, metadata, &body, Some(lengths)).await?;
     Ok(true)
 }
 
@@ -430,7 +426,7 @@ fn extract_written_paths(path: &Path) -> Vec<PathBuf> {
     sorted
 }
 
-fn ingest_authored_file(db: &mut DB, path: &Path, project_name: &str, mtime_ms: i64) -> Result<bool> {
+async fn ingest_authored_file(wc: &mut Witchcraft, path: &Path, project_name: &str, mtime_ms: i64) -> Result<bool> {
     let raw = fs::read_to_string(path)?;
     if raw.trim().is_empty() {
         return Ok(false);
@@ -464,14 +460,12 @@ fn ingest_authored_file(db: &mut DB, path: &Path, project_name: &str, mtime_ms: 
         return Ok(false);
     }
 
-    let metadata = serde_json::json!({
-        "project": project_name,
-        "path": path_str,
-        "mtime_ms": mtime_ms,
-    })
-    .to_string();
+    let mut metadata = HashMap::new();
+    metadata.insert("project".to_string(), MetadataValue::String(project_name.to_string()));
+    metadata.insert("path".to_string(), MetadataValue::String(path_str.to_string()));
+    metadata.insert("source".to_string(), MetadataValue::String("claude".to_string()));
 
-    db.add_doc(&uuid, None, &metadata, &body, Some(lengths))?;
+    wc.add_document(&uuid, None, metadata, &body, Some(lengths)).await?;
     Ok(true)
 }
 
@@ -482,7 +476,7 @@ fn split_markdown(text: &str) -> Vec<String> {
 
 use crate::watermark;
 
-pub fn ingest_claude_code(db: &mut DB) -> Result<(usize, usize, usize)> {
+pub async fn ingest_claude_code(wc: &mut Witchcraft) -> Result<(usize, usize, usize)> {
     let home = std::env::var("HOME").unwrap_or_default();
     let projects_dir = PathBuf::from(&home).join(".claude/projects");
 
@@ -533,7 +527,7 @@ pub fn ingest_claude_code(db: &mut DB) -> Result<(usize, usize, usize)> {
                     authored_paths.insert(p);
                 }
             }
-            match ingest_session(db, jsonl_path, &project_name, mtime_ms) {
+            match ingest_session(wc, jsonl_path, &project_name, mtime_ms).await {
                 Ok(n) => session_count += n,
                 Err(e) => {
                     log::warn!("failed to ingest {}: {e}", jsonl_path.display());
@@ -558,7 +552,7 @@ pub fn ingest_claude_code(db: &mut DB) -> Result<(usize, usize, usize)> {
                 }
                 println!("{}", md_path.display());
                 let mtime_ms = file_mtime_ms(md_path).unwrap_or(0);
-                match ingest_memory_file(db, md_path, &project_name, mtime_ms) {
+                match ingest_memory_file(wc, md_path, &project_name, mtime_ms).await {
                     Ok(true) => memory_count += 1,
                     Ok(false) => {}
                     Err(e) => {
@@ -577,7 +571,7 @@ pub fn ingest_claude_code(db: &mut DB) -> Result<(usize, usize, usize)> {
             }
             let mtime_ms = file_mtime_ms(md_path).unwrap_or(0);
             println!("{}", md_path.display());
-            match ingest_authored_file(db, md_path, &project_name, mtime_ms) {
+            match ingest_authored_file(wc, md_path, &project_name, mtime_ms).await {
                 Ok(true) => authored_count += 1,
                 Ok(false) => {}
                 Err(e) => {

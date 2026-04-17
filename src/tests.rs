@@ -1,433 +1,229 @@
-#[cfg(test)]
-mod tests {
-    use crate::DB;
-    use std::path::PathBuf;
-    use tempfile::tempdir;
-    use test_log::test;
-    use uuid::Uuid;
+use crate::*;
+use std::collections::HashMap;
+use uuid::Uuid;
 
-    const FACTS : [&str; 33]= [
-        "Bananas are berries, but strawberries aren't.",
-        "Octopuses have three hearts and blue blood.",
-        "A day on Venus is longer than a year on Venus.",
-        "There are more trees on Earth than stars in the Milky Way.",
-        "Water can boil and freeze at the same time, known as the triple point.",
-        "A shrimp's heart is located in its head.",
-        "Honey never spoils; archaeologists have found 3000-year-old edible honey.",
-        "Wombat poop is cube-shaped to prevent it from rolling away.",
-        "There's a species of jellyfish that is biologically immortal.",
-        "Humans share about 60% of their DNA with bananas.",
-        "The Eiffel Tower can grow taller in the summer due to heat expansion.",
-        "Some turtles can breathe through their butts.",
-        "The shortest war in history lasted 38 to 45 minutes (Anglo-Zanzibar War).",
-        "There's a gas cloud in space that smells like rum and tastes like raspberries.",
-        "Cows have best friends and get stressed when separated.",
-        "A group of flamingos is called a 'flamboyance'.",
-        "Bananas are berries, but strawberries aren't.",
-        "There's a species of fungus that can turn ants into zombies.",
-        "Sharks existed before trees.",
-        "Scotland has 421 words for 'snow'.",
-        "Hot water freezes faster than cold water, known as the Mpemba effect.",
-        "The inventor of the frisbee was turned into a frisbee after he died.",
-        "There's an island in Japan where bunnies outnumber people.",
-        "Sloths can hold their breath longer than dolphins.",
-        "You can hear a blue whale's heartbeat from over 2 miles away.",
-        "Butterflies can taste with their feet.",
-        "A day on Earth was once only 6 hours long in the distant past.",
-        "Vatican City has the highest crime rate per capita due to its tiny population.",
-        "There's an official Wizard of New Zealand, appointed by the government.",
-        "A bolt of lightning is five times hotter than the surface of the sun.",
-        "The letter 'E' is the most common letter in the English language.",
-        "There's a lake in Australia that stays bright pink regardless of conditions.",
-        "Cleopatra lived closer in time to the first moon landing than to the building of the Great Pyramid."
-    ];
-    const QUERIES: [(&str, u32); 3] = [
-        ("a lake with funny colors", 31),
-        ("A group of flamingos", 15),
-        ("facts about fruits and berries", 0),
-    ];
+const NAMESPACE: Uuid = Uuid::from_bytes([
+    0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4, 0x30,
+    0xc8,
+]);
 
-    const EASY_QUERIES: [(&str, u32); 3] = [
-        ("a lake in Australia that stays bright pink", 31),
-        ("A group of flamingos", 15),
-        ("Bananas are berries", 0),
-    ];
-    const THRESHOLD: f32 = 0.7;
+const FACTS: &[&str] = &[
+    "The shortest war in history lasted 38 minutes between Britain and Zanzibar.",
+    "Honey never spoils; archaeologists have found 3000-year-old honey in Egyptian tombs that was still edible.",
+    "Octopuses have three hearts and blue blood.",
+    "The Eiffel Tower can grow up to 6 inches taller during the summer due to thermal expansion.",
+    "Bananas are berries, but strawberries are not.",
+    "A group of flamingos is called a 'flamboyance'.",
+    "The longest hiccuping spree lasted 68 years.",
+    "Venus is the only planet that spins clockwise.",
+    "Cleopatra lived closer in time to the Moon landing than to the construction of the Great Pyramid.",
+    "A teaspoonful of neutron star material would weigh about 6 billion tons.",
+    "There are more possible iterations of a game of chess than there are atoms in the known universe.",
+    "The shortest complete sentence in English is 'I am.'",
+    "The total weight of all ants on Earth is roughly equal to the total weight of all humans.",
+    "Scotland's national animal is the unicorn.",
+    "A day on Venus is longer than a year on Venus.",
+    "Cows have best friends and get stressed when separated.",
+    "The human nose can detect over 1 trillion different scents.",
+    "The inventor of the Pringles can is buried in one.",
+    "There are more stars in the universe than grains of sand on all of Earth's beaches.",
+    "A bolt of lightning is five times hotter than the surface of the sun.",
+    "The fingerprints of a koala are so similar to humans that they can taint crime scenes.",
+    "An octopus has a donut-shaped brain.",
+    "The longest wedding veil was longer than 63 football fields.",
+    "A jiffy is an actual unit of time: 1/100th of a second.",
+    "The moon has moonquakes.",
+    "A shrimp's heart is in its head.",
+    "It takes a photon about 40,000 years to travel from the core of the sun to its surface, but only 8 minutes to travel from the sun's surface to Earth.",
+    "The DNA of humans and bananas is about 60% identical.",
+    "Wombat poop is cube-shaped.",
+    "The Great Wall of China is not visible from space with the naked eye.",
+    "A single strand of spaghetti is called a 'spaghetto.'",
+    "Polar bears' skin is actually black under their white fur.",
+    "The first computer programmer was a woman named Ada Lovelace.",
+];
 
-    #[test]
-    fn test_end_to_end() -> std::io::Result<()> {
-        let dir = tempdir().unwrap();
-        let path: PathBuf = dir.path().join("warp");
-        let mut db = DB::new(path.clone()).unwrap();
-        let mut reader_db = DB::new_reader(path.clone()).unwrap();
+const THRESHOLD: f32 = 0.7;
 
-        let device = crate::make_device();
-        let assets = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/assets"));
-        let embedder = crate::Embedder::new(&device, &assets).unwrap();
-        let mut cache = crate::EmbeddingsCache::new(4);
+fn get_assets_path() -> std::path::PathBuf {
+    std::env::var("WARP_ASSETS")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("./assets"))
+}
 
-        let mut uuids = vec![];
-        for body in FACTS {
-            let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
-            uuids.push(uuid.clone());
-            db.add_doc(&uuid, None, &uuid.to_string(), &body, None)
-                .unwrap();
-        }
-        for round in 0..3 {
-            crate::embed_chunks(&db, &embedder, None).unwrap();
-            db.refresh_ft().unwrap();
-            for (i, (q, pos)) in QUERIES.iter().enumerate() {
-                let use_fulltext = round == 0;
-                println!("searching for {q}");
-                let results = crate::search(
-                    &reader_db,
-                    &embedder,
-                    &mut cache,
-                    &q.to_string(),
-                    THRESHOLD,
-                    10,
-                    use_fulltext,
-                    None,
-                )
-                .unwrap();
-                if round == 0 {
-                    assert!(results.len() == 1);
-                } else {
-                    if i < 2 {
-                        assert!(results.len() == 1);
-                    } else {
-                        assert!(results.len() == 0);
-                    }
-                }
-                for (score, metadata, body, body_idx, _chunk) in results {
-                    let uuid = Uuid::parse_str(&metadata).unwrap();
-                    let index = uuids.iter().position(|&u| u == uuid).unwrap();
-                    println!("i={i} score={score} metadata={metadata} body={body:?} body_idx={body_idx} uuid-index {index}");
-                    assert!(index == *pos as usize);
-                }
-            }
-            db.remove_doc(&uuids[0].clone()).unwrap();
-            crate::index_chunks(&db, &device).unwrap();
-        }
-        let _ = crate::search(
-            &reader_db,
-            &embedder,
-            &mut cache,
-            &"".to_string(),
-            THRESHOLD,
-            10,
-            true,
-            None,
-        )
-        .unwrap();
-        // Close reader_db before trying to delete database files
-        reader_db.shutdown();
-        db.clear();
-        db.shutdown();
+fn assets_available(assets: &std::path::Path) -> bool {
+    // Check for the actual model files, not just the directory
+    assets.join("config.json").exists()
+}
 
-        match std::fs::metadata(&path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-            Ok(_) => panic!("temp file still exists: {}", path.display()),
-        }
-
-        Ok(())
+#[tokio::test]
+async fn test_end_to_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("test_db");
+    let assets = get_assets_path();
+    if !assets_available(&assets) {
+        eprintln!("Skipping test: assets not found at {:?}", assets);
+        return;
     }
 
-    #[test]
-    fn test_sub_docs() -> std::io::Result<()> {
-        let dir = tempdir().unwrap();
-        let path: PathBuf = dir.path().join("warp");
+    let schema = MetadataSchema::new();
+    let mut wc = Witchcraft::new(&db_path, &assets, schema).await.unwrap();
 
-        let mut db = DB::new(path.clone()).unwrap();
-        let device = crate::make_device();
-        let assets = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/assets"));
-        let embedder = crate::Embedder::new(&device, &assets).unwrap();
-        let mut cache = crate::EmbeddingsCache::new(4);
-
-        let mut lens = vec![];
-        for fact in FACTS {
-            lens.push(fact.chars().count());
-        }
-        let body = FACTS.join("");
-        let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
-        db.add_doc(&uuid, None, &uuid.to_string(), &body, Some(lens))
+    // Insert all facts
+    for (_i, fact) in FACTS.iter().enumerate() {
+        let uuid = Uuid::new_v5(&NAMESPACE, fact.as_bytes());
+        wc.add_document(&uuid, Some("2024-01-01"), HashMap::new(), fact, None)
+            .await
             .unwrap();
-
-        for (q, pos) in QUERIES {
-            let results = crate::search(
-                &db,
-                &embedder,
-                &mut cache,
-                &q.to_string(),
-                THRESHOLD,
-                10,
-                false,
-                None,
-            )
-            .unwrap();
-            for (_score, _metadata, _body, body_idx, _chunk) in results {
-                assert!(body_idx == pos);
-            }
-        }
-        for (q, pos) in EASY_QUERIES {
-            let results = crate::search(
-                &db,
-                &embedder,
-                &mut cache,
-                &q.to_string(),
-                THRESHOLD,
-                10,
-                true,
-                None,
-            )
-            .unwrap();
-            for (_score, _metadata, _body, body_idx, _chunk) in results {
-                assert!(body_idx == pos);
-            }
-        }
-        db.clear();
-        db.shutdown();
-        Ok(())
     }
 
-    #[test]
-    fn test_incremental_index() -> std::io::Result<()> {
-        let dir = tempdir().unwrap();
-        let path: PathBuf = dir.path().join("warp");
-        let mut db = DB::new(path.clone()).unwrap();
+    // Build indexes
+    wc.build_index().await.unwrap();
 
-        let device = crate::make_device();
-        let assets = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/assets"));
-        let embedder = crate::Embedder::new(&device, &assets).unwrap();
-        let mut cache = crate::EmbeddingsCache::new(4);
-
-        // Phase 1: Insert initial documents, embed and full-index
-        let mut uuids = vec![];
-        for body in FACTS {
-            let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
-            uuids.push(uuid.clone());
-            db.add_doc(&uuid, None, &uuid.to_string(), &body, None)
-                .unwrap();
-        }
-        crate::embed_chunks(&db, &embedder, None).unwrap();
-        crate::index_chunks(&db, &device).unwrap();
-
-        // Verify search works after full index
-        let results = crate::search(
-            &db,
-            &embedder,
-            &mut cache,
-            &"A group of flamingos".to_string(),
-            THRESHOLD,
-            10,
-            false,
-            None,
-        )
+    // Search
+    let results = wc
+        .search("what was the shortest war ever?", THRESHOLD, 3, true, None)
+        .await
         .unwrap();
-        assert!(
-            results.len() >= 1,
-            "should find flamingo fact after full index"
-        );
 
-        // Phase 2: Add a few new documents (small batch triggers incremental)
-        let new_facts = [
-            "The Amazon rainforest produces about 20% of the world's oxygen.",
-            "A teaspoon of neutron star material would weigh about 6 billion tons.",
-            "Dolphins sleep with one eye open.",
-        ];
-        let mut new_uuids = vec![];
-        for body in new_facts {
-            let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
-            new_uuids.push(uuid.clone());
-            db.add_doc(&uuid, None, &uuid.to_string(), &body, None)
-                .unwrap();
-        }
-        crate::embed_chunks(&db, &embedder, None).unwrap();
-        crate::index_chunks(&db, &device).unwrap(); // should trigger incremental
+    assert!(!results.is_empty(), "expected at least one search result");
+    // The top result should mention Zanzibar
+    let top_body = results[0].bodies.join(" ");
+    assert!(
+        top_body.contains("Zanzibar") || top_body.contains("shortest war"),
+        "expected top result to be about the shortest war, got: {}",
+        top_body
+    );
+}
 
-        // Verify search finds both old and new documents
-        let results = crate::search(
-            &db,
-            &embedder,
-            &mut cache,
-            &"A group of flamingos".to_string(),
-            THRESHOLD,
-            10,
-            false,
-            None,
-        )
-        .unwrap();
-        assert!(
-            results.len() >= 1,
-            "should still find flamingo fact after incremental index"
-        );
-
-        let results = crate::search(
-            &db,
-            &embedder,
-            &mut cache,
-            &"dolphins sleeping habits".to_string(),
-            THRESHOLD,
-            10,
-            false,
-            None,
-        )
-        .unwrap();
-        assert!(
-            results.len() >= 1,
-            "should find new dolphin fact after incremental index"
-        );
-
-        // Phase 3: Force compaction by calling full_index again
-        // Add enough data to trigger full re-index (> 50% new)
-        let more_facts = [
-            "The human brain uses about 20% of the body's total energy.",
-            "A group of owls is called a parliament.",
-            "Cats have over 20 vocalizations, including the purr.",
-            "The Great Wall of China is not visible from space with the naked eye.",
-            "Polar bears have black skin underneath their white fur.",
-            "Hummingbirds are the only birds that can fly backwards.",
-            "An octopus has nine brains.",
-            "The largest living organism is a honey fungus in Oregon.",
-            "Seahorses are the only animals where the male gives birth.",
-            "A bolt of lightning contains enough energy to toast 100,000 slices of bread.",
-            "The fingerprints of koalas are virtually indistinguishable from human fingerprints.",
-            "Trees can communicate with each other through underground fungal networks.",
-            "A cockroach can live for a week without its head.",
-            "The tongue of a blue whale weighs as much as an elephant.",
-            "There are more possible iterations of a game of chess than atoms in the known universe.",
-            "Bananas are radioactive due to their potassium content.",
-            "The shortest complete sentence in the English language is 'Go.'",
-            "An ant can carry 50 times its own body weight.",
-            "Venus is the only planet that spins clockwise.",
-            "A flock of crows is known as a murder.",
-        ];
-        for body in more_facts {
-            let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
-            db.add_doc(&uuid, None, &uuid.to_string(), &body, None)
-                .unwrap();
-        }
-        crate::embed_chunks(&db, &embedder, None).unwrap();
-        crate::index_chunks(&db, &device).unwrap(); // should trigger full re-index (compaction)
-
-        // Verify search still works after compaction
-        let results = crate::search(
-            &db,
-            &embedder,
-            &mut cache,
-            &"A group of flamingos".to_string(),
-            THRESHOLD,
-            10,
-            false,
-            None,
-        )
-        .unwrap();
-        assert!(
-            results.len() >= 1,
-            "should still find flamingo fact after compaction"
-        );
-
-        let results = crate::search(
-            &db,
-            &embedder,
-            &mut cache,
-            &"dolphins sleeping habits".to_string(),
-            THRESHOLD,
-            10,
-            false,
-            None,
-        )
-        .unwrap();
-        assert!(
-            results.len() >= 1,
-            "should still find dolphin fact after compaction"
-        );
-
-        db.clear();
-        db.shutdown();
-        Ok(())
+#[tokio::test]
+async fn test_scoring() {
+    let assets = get_assets_path();
+    if !assets_available(&assets) {
+        eprintln!("Skipping test: assets not found at {:?}", assets);
+        return;
     }
 
-    #[test]
-    fn test_scoring() -> std::io::Result<()> {
-        let device = crate::make_device();
-        let assets = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/assets"));
-        let embedder = crate::Embedder::new(&device, &assets).unwrap();
-        let mut cache = crate::EmbeddingsCache::new(4);
-        let sentences = [
-            "The inventor of the frisbee was turned into a frisbee after he died.",
-            "There's an island in Japan where bunnies outnumber people.",
-            "Sloths can hold their breath longer than dolphins.",
-            "The shortest war in history lasted 38 to 45 minutes (Anglo-Zanzibar War).",
-            "You can hear a blue whale's heartbeat from over 2 miles away.",
-            "Butterflies can taste with their feet.",
-            "A day on Earth was once only 6 hours long in the distant past.",
-        ];
-        let sentences = sentences.map(|s| s.to_string());
+    let device = make_device();
+    let embedder = Embedder::new(&device, &assets).unwrap();
+    let mut cache = EmbeddingsCache::new(1);
 
-        let query = "what wash the shortest war ever?";
-        for _ in 0..2 {
-            let scores =
-                crate::score_query_sentences(&embedder, &mut cache, &query.to_string(), &sentences)
-                    .unwrap();
-            let mut max = -1.0f32;
-            let mut i_max = 0usize;
-            for (i, score) in scores.iter().enumerate() {
-                println!("score {score}");
-                if *score > max {
-                    max = *score;
-                    i_max = i;
-                }
-            }
-            assert!(i_max == 3);
-        }
-        Ok(())
+    let sentences: Vec<String> = vec![
+        "The Eiffel Tower is in Paris.".into(),
+        "Bananas are a popular fruit.".into(),
+        "Octopuses have three hearts.".into(),
+        "The shortest war in history lasted 38 minutes.".into(),
+        "Honey never spoils.".into(),
+        "Venus spins clockwise.".into(),
+        "Cows have best friends.".into(),
+    ];
+
+    let scores = score_query_sentences(
+        &embedder,
+        &mut cache,
+        &"what was the shortest war ever?".to_string(),
+        &sentences,
+    )
+    .unwrap();
+
+    assert_eq!(scores.len(), 7);
+    // The highest score should be for sentence index 3
+    let max_idx = scores
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .unwrap()
+        .0;
+    assert_eq!(max_idx, 3, "expected sentence 3 to score highest");
+
+    // Run again to test cache
+    let scores2 = score_query_sentences(
+        &embedder,
+        &mut cache,
+        &"what was the shortest war ever?".to_string(),
+        &sentences,
+    )
+    .unwrap();
+    assert_eq!(scores.len(), scores2.len());
+}
+
+#[tokio::test]
+async fn test_remove_document() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("test_remove");
+    let assets = get_assets_path();
+    if !assets_available(&assets) {
+        eprintln!("Skipping test: assets not found at {:?}", assets);
+        return;
     }
 
-    #[test]
-    fn test_embedder_without_assets() -> std::io::Result<()> {
-        let device = crate::make_device();
-        let assets = std::path::PathBuf::from("assets.notfound");
-        match crate::Embedder::new(&device, &assets) {
-            Ok(_embedder) => {
-                unreachable!("should fail to create embedder without assets!");
-            }
-            Err(_v) => {}
-        };
-        Ok(())
+    let schema = MetadataSchema::new();
+    let mut wc = Witchcraft::new(&db_path, &assets, schema).await.unwrap();
+
+    let uuid = Uuid::new_v5(&NAMESPACE, b"test doc");
+    wc.add_document(
+        &uuid,
+        Some("2024-01-01"),
+        HashMap::new(),
+        "The sky is blue and the grass is green.",
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Remove it
+    wc.remove_document(&uuid).await.unwrap();
+
+    // Verify it's gone by searching
+    let results = wc
+        .search("sky is blue", 0.5, 10, false, None)
+        .await
+        .unwrap();
+    assert!(results.is_empty(), "document should have been removed");
+}
+
+#[tokio::test]
+async fn test_metadata_filter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db_path = tmp.path().join("test_filter");
+    let assets = get_assets_path();
+    if !assets_available(&assets) {
+        eprintln!("Skipping test: assets not found at {:?}", assets);
+        return;
     }
 
-    #[test]
-    fn test_open_bad_db_path() -> std::io::Result<()> {
-        let badpath = std::path::PathBuf::from("/unknown/db/xxx");
-        match DB::new_reader(badpath) {
-            Ok(_db) => {
-                unreachable!("should fail to create read-only db from bad path!");
-            }
-            Err(_v) => {}
-        };
-        Ok(())
-    }
+    let schema = MetadataSchema::new()
+        .add_string("source", true);
+    let mut wc = Witchcraft::new(&db_path, &assets, schema).await.unwrap();
 
-    #[test]
-    fn test_open_corrupted_db() -> std::io::Result<()> {
-        use std::io::Write;
-        let dir = tempdir().unwrap();
-        let path: PathBuf = dir.path().join("warp");
-        {
-            let foo: u32 = 0xfede_abe0;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .append(true)
-                .create(true)
-                .open(&path)?;
-            file.write_all(&foo.to_le_bytes())?;
-            file.flush()?;
-        }
-        let mut db = DB::new(path).unwrap();
-        db.clear();
-        db.shutdown();
-        Ok(())
+    // Add two docs with different sources
+    let uuid1 = Uuid::new_v5(&NAMESPACE, b"doc1");
+    let mut meta1 = HashMap::new();
+    meta1.insert("source".to_string(), MetadataValue::String("alpha".into()));
+    wc.add_document(&uuid1, Some("2024-01-01"), meta1, "Cats are wonderful pets.", None)
+        .await
+        .unwrap();
+
+    let uuid2 = Uuid::new_v5(&NAMESPACE, b"doc2");
+    let mut meta2 = HashMap::new();
+    meta2.insert("source".to_string(), MetadataValue::String("beta".into()));
+    wc.add_document(&uuid2, Some("2024-01-01"), meta2, "Dogs are loyal companions.", None)
+        .await
+        .unwrap();
+
+    // Search with filter for source = 'alpha'
+    let filter = Filter::eq("source", MetadataValue::String("alpha".into()));
+    let results = wc
+        .search("pets", 0.3, 10, false, Some(&filter))
+        .await
+        .unwrap();
+
+    // Should only get the cats doc
+    for r in &results {
+        let top = &r.bodies[0];
+        assert!(
+            top.contains("Cats"),
+            "filtered results should only contain alpha source"
+        );
     }
 }

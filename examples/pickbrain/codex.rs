@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
-use witchcraft::DB;
+use std::collections::HashMap;
+use witchcraft::{MetadataValue, Witchcraft};
 
 const MIN_CHUNK_CODEPOINTS: usize = 5;
 const MAX_CHUNK_CODEPOINTS: usize = 4000;
@@ -188,7 +189,7 @@ fn session_id_from_filename(path: &Path) -> String {
     stem.to_string()
 }
 
-fn ingest_session(db: &mut DB, path: &Path, mtime_ms: i64) -> Result<usize> {
+async fn ingest_session(wc: &mut Witchcraft, path: &Path, mtime_ms: i64) -> Result<usize> {
     let (cwd, chunks) = parse_session_file(path);
     if chunks.is_empty() {
         return Ok(0);
@@ -247,20 +248,18 @@ fn ingest_session(db: &mut DB, path: &Path, mtime_ms: i64) -> Result<usize> {
             format!("{session_id}:{turn_idx}").as_bytes(),
         );
 
-        let metadata = serde_json::json!({
-            "source": "codex",
-            "project": project_name,
-            "session_id": session_id,
-            "turn": turn_idx,
-            "path": path.to_string_lossy(),
-            "cwd": cwd,
-            "mtime_ms": mtime_ms,
-            "turns": turns_meta,
-        })
-        .to_string();
+        let mut metadata = HashMap::new();
+        metadata.insert("source".to_string(), MetadataValue::String("codex".to_string()));
+        metadata.insert("project".to_string(), MetadataValue::String(project_name.clone()));
+        metadata.insert("session_id".to_string(), MetadataValue::String(session_id.clone()));
+        metadata.insert("turn".to_string(), MetadataValue::Number(turn_idx as f64));
+        metadata.insert("path".to_string(), MetadataValue::String(path.to_string_lossy().to_string()));
+        if let Some(ref cwd_val) = cwd {
+            metadata.insert("cwd".to_string(), MetadataValue::String(cwd_val.clone()));
+        }
 
-        let date = iso8601_timestamp::Timestamp::parse(&interaction[0].timestamp);
-        db.add_doc(&uuid, date, &metadata, &body, Some(lengths))?;
+        let date_str = &interaction[0].timestamp;
+        wc.add_document(&uuid, Some(date_str), metadata, &body, Some(lengths)).await?;
         count += 1;
     }
 
@@ -301,7 +300,7 @@ fn collect_session_files(base: &Path) -> Vec<PathBuf> {
     files
 }
 
-pub fn ingest_codex(db: &mut DB) -> Result<usize> {
+pub async fn ingest_codex(wc: &mut Witchcraft) -> Result<usize> {
     let home = std::env::var("HOME").unwrap_or_default();
     let sessions_dir = PathBuf::from(&home).join(".codex/sessions");
 
@@ -319,7 +318,7 @@ pub fn ingest_codex(db: &mut DB) -> Result<usize> {
         }
         let mtime_ms = file_mtime_ms(&jsonl_path).unwrap_or(0);
         println!("{}", jsonl_path.display());
-        match ingest_session(db, &jsonl_path, mtime_ms) {
+        match ingest_session(wc, &jsonl_path, mtime_ms).await {
             Ok(n) => session_count += n,
             Err(e) => {
                 log::warn!("failed to ingest codex {}: {e}", jsonl_path.display());

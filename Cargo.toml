@@ -34,6 +34,12 @@ indicatif = { version = "0.17.11", optional = true }
 csv = "1.3.1"
 tempfile = "3.20.0"
 
+lancedb = "0.27.2"
+tokio = { version = "1", features = ["full"] }
+arrow-array = "57"
+arrow-schema = "57"
+futures = "0.3"
+
 napi = { version = "3.2.2", optional = true }
 napi-derive = { version = "3.2.2", optional = true }
 once_cell = "1.21.3"
@@ -46,7 +52,6 @@ log = "0.4.28"
 text-splitter = { version = "0.28.0", features = ["markdown"] } # !Dash
 regex = "1"                # !Dash
 chrono = "0.4"             # !Dash
-lz4_flex = "0.11.5"
 strsim = "0.11.1"
 rayon = { version = "1", optional = true }
 fbgemm-rs = { path = "fbgemm-rs", optional = true, features = ["rayon"] }
@@ -91,6 +96,4 @@ metal = ["dep:metal", "dep:candle-metal-kernels", "dep:ug-metal"]
 hybrid-dequant = ["dep:rayon"]
 fbgemm = ["dep:fbgemm-rs"]
 
-[dependencies.rusqlite]
-version = "0.35.0"
-features = ["bundled"]
+

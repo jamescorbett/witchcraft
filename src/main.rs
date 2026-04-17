@@ -1,27 +1,17 @@
 use anyhow::Result;
-use log::debug;
-use log::{Level, LevelFilter, Metadata, Record};
-use serde::{Deserialize, Serialize};
-use std::env;
-use std::fs::File;
-use std::io::{BufWriter, Write};
-use text_splitter::TextSplitter;
-use uuid::Uuid;
-
-mod histogram;
-
-use witchcraft::DB;
+use log::info;
+use std::path::PathBuf;
+use witchcraft::*;
 
 struct SimpleLogger;
+
 impl log::Log for SimpleLogger {
-    fn enabled(&self, metadata: &Metadata) -> bool {
-        metadata.level() <= Level::Trace
+    fn enabled(&self, _metadata: &log::Metadata) -> bool {
+        true
     }
 
-    fn log(&self, record: &Record) {
-        if self.enabled(record.metadata()) {
-            println!("[{}] {}", record.level(), record.args());
-        }
+    fn log(&self, record: &log::Record) {
+        println!("{}: {}", record.level(), record.args());
     }
 
     fn flush(&self) {}
@@ -29,236 +19,136 @@ impl log::Log for SimpleLogger {
 
 static LOGGER: SimpleLogger = SimpleLogger;
 
-#[derive(Debug, Deserialize)]
-struct CSVRecord {
-    name: String,
-    body: String,
+fn get_assets_path() -> PathBuf {
+    std::env::var("WARP_ASSETS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("./assets"))
 }
 
-#[derive(Serialize, Deserialize)]
-struct CorpusMetaData {
-    key: String,
+#[tokio::main]
+async fn main() -> Result<()> {
+    log::set_logger(&LOGGER).unwrap();
+    log::set_max_level(log::LevelFilter::Info);
+
+    let args: Vec<String> = std::env::args().collect();
+
+    if args.len() < 2 {
+        eprintln!("Usage: warp-cli <command> [args...]");
+        eprintln!("Commands: embed, index, query <text>, hybrid <text>, clear, score <query> <sentences...>");
+        std::process::exit(1);
+    }
+
+    let db_path = PathBuf::from("mydb.lance");
+    let assets = get_assets_path();
+    let schema = MetadataSchema::new();
+
+    match args[1].as_str() {
+        "readcsv" => {
+            if args.len() < 3 {
+                eprintln!("Usage: warp-cli readcsv <file.tsv>");
+                std::process::exit(1);
+            }
+            let csvname = PathBuf::from(&args[2]);
+            let mut wc = Witchcraft::new(&db_path, &assets, schema).await?;
+            read_csv(&mut wc, csvname).await?;
+        }
+        "index" => {
+            let mut wc = Witchcraft::new(&db_path, &assets, schema).await?;
+            wc.build_index().await?;
+        }
+        "query" | "hybrid" => {
+            if args.len() < 3 {
+                eprintln!("Usage: warp-cli {} <text>", args[1]);
+                std::process::exit(1);
+            }
+            let use_fulltext = args[1] == "hybrid";
+            let query_text = args[2..].join(" ");
+            let mut wc = Witchcraft::new(&db_path, &assets, schema).await?;
+            let results = wc.search(&query_text, 0.7, 10, use_fulltext, None).await?;
+
+            for (i, r) in results.iter().enumerate() {
+                println!(
+                    "#{} score={:.4} date={} sub_idx={}",
+                    i + 1,
+                    r.score,
+                    r.date,
+                    r.matched_sub_idx
+                );
+                let idx = r.matched_sub_idx as usize;
+                if idx < r.bodies.len() {
+                    let preview: String = r.bodies[idx].chars().take(200).collect();
+                    println!("  {}", preview);
+                }
+                println!();
+            }
+        }
+        "score" => {
+            if args.len() < 4 {
+                eprintln!("Usage: warp-cli score <query> <sentence1> [sentence2] ...");
+                std::process::exit(1);
+            }
+            let device = make_device();
+            let embedder = Embedder::new(&device, &assets)?;
+            let mut cache = EmbeddingsCache::new(1);
+            let q = args[2].clone();
+            let sentences: Vec<String> = args[3..].iter().cloned().collect();
+            let scores =
+                score_query_sentences(&embedder, &mut cache, &q, &sentences)?;
+            for (s, score) in sentences.iter().zip(scores.iter()) {
+                println!("{:.4} {}", score, s);
+            }
+        }
+        "clear" => {
+            let mut wc = Witchcraft::new(&db_path, &assets, schema).await?;
+            wc.clear().await?;
+            info!("Database cleared.");
+        }
+        _ => {
+            eprintln!("Unknown command: {}", args[1]);
+            std::process::exit(1);
+        }
+    }
+
+    Ok(())
 }
 
-fn split_doc(body: String) -> Vec<String> {
-    let max_characters = 300;
-    let splitter = TextSplitter::new(max_characters);
-    splitter
-        .chunks(&body)
-        .map(|body| format!("{body}\n").to_string())
-        .collect()
-}
+/// Read a TSV file and add each record as a document.
+async fn read_csv(wc: &mut Witchcraft, csvname: PathBuf) -> Result<()> {
+    use csv::ReaderBuilder;
+    use std::collections::HashMap;
+    use uuid::Uuid;
 
-pub fn read_csv(db: &mut DB, csvname: std::path::PathBuf) -> Result<()> {
-    println!("register documents from CSV...");
+    #[derive(serde::Deserialize)]
+    #[allow(dead_code)]
+    struct CSVRecord {
+        name: String,
+        body: String,
+    }
 
-    let file = File::open(csvname)?;
-    let mut rdr = csv::ReaderBuilder::new()
+    let namespace = Uuid::from_bytes([
+        0x6b, 0xa7, 0xb8, 0x10, 0x9d, 0xad, 0x11, 0xd1, 0x80, 0xb4, 0x00, 0xc0, 0x4f, 0xd4,
+        0x30, 0xc8,
+    ]);
+
+    let mut reader = ReaderBuilder::new()
         .delimiter(b'\t')
-        .has_headers(false)
-        .from_reader(file);
+        .from_path(&csvname)?;
 
-    for result in rdr.deserialize() {
+    let mut count = 0;
+    for result in reader.deserialize() {
         let record: CSVRecord = result?;
-        let metadata = CorpusMetaData { key: record.name };
-        let metadata = serde_json::to_string(&metadata)?;
-        let body = record.body;
-
-        let bodies = split_doc(body.clone());
-        let lens = bodies.iter().map(|b| b.chars().count()).collect();
-        let body = bodies.join("");
-        let uuid = Uuid::new_v5(&Uuid::NAMESPACE_OID, body.as_bytes());
-        db.add_doc(&uuid, None, &metadata, &body, Some(lens))
-            .unwrap();
-    }
-
-    Ok(())
-}
-
-pub fn bulk_search(
-    db: &DB,
-    embedder: Option<&witchcraft::Embedder>,
-    csvname: std::path::PathBuf,
-    outputname: std::path::PathBuf,
-    use_fulltext: bool,
-) -> Result<()> {
-    let file = File::open(csvname)?;
-    let mut rdr = csv::ReaderBuilder::new()
-        .delimiter(b'\t')
-        .has_headers(false)
-        .from_reader(file);
-
-    let file = File::create(outputname).unwrap();
-    let mut writer = BufWriter::new(file);
-
-    let mut metadata_query = db.query("SELECT metadata FROM document WHERE rowid = ?1")?;
-    let mut histogram = histogram::Histogram::new(10000);
-    let mut embedder_histogram = histogram::Histogram::new(10000);
-
-    for result in rdr.deserialize() {
-        let record: (String, String) = result?;
-        let key = record.0;
-        let question = record.1;
-        let top_k = 100;
-
-        debug!("searching for: {}", question);
-        let now = std::time::Instant::now();
-        let fts_start = std::time::Instant::now();
-        let fts_matches = if use_fulltext {
-            witchcraft::fulltext_search(db, &question, top_k, None)?
-        } else {
-            vec![]
-        };
-        if use_fulltext {
-            debug!(
-                "fulltext search took {} ms.",
-                fts_start.elapsed().as_millis()
-            );
-        }
-
-        let sem_matches = if let Some(embedder) = embedder {
-            let now = std::time::Instant::now();
-            let (qe, _offsets) = embedder.embed(&question)?;
-            let qe = qe.get(0)?;
-            let embedder_latency_ms = now.elapsed().as_millis() as u32;
-            embedder_histogram.record(embedder_latency_ms);
-
-            let match_start = std::time::Instant::now();
-            let matches = witchcraft::match_centroids(db, &qe, 0.0, top_k, None).unwrap();
-            debug!(
-                "match_centroids call took {} ms.",
-                match_start.elapsed().as_millis()
-            );
-            matches
-        } else {
-            vec![]
-        };
-        let sem_idxs: Vec<witchcraft::DocPtr> = sem_matches
-            .iter()
-            .map(|&(_, idx, sub_idx)| (idx, sub_idx))
+        let chunks: Vec<String> = text_splitter::TextSplitter::new(300)
+            .chunks(&record.body)
+            .map(|s| s.to_string())
             .collect();
+        let body = chunks.join("");
+        let lens: Vec<usize> = chunks.iter().map(|c| c.chars().count()).collect();
+        let uuid = Uuid::new_v5(&namespace, body.as_bytes());
 
-        let fusion_start = std::time::Instant::now();
-        let mut fused = if use_fulltext {
-            let fts_idxs: Vec<witchcraft::DocPtr> = fts_matches
-                .iter()
-                .map(|&(_, idx, sub_idx)| (idx, sub_idx))
-                .collect();
-            witchcraft::reciprocal_rank_fusion(&fts_idxs, &sem_idxs, 60.0)
-        } else {
-            sem_idxs
-        };
-        fused.truncate(top_k);
-        debug!(
-            "rank fusion took {} ms.",
-            fusion_start.elapsed().as_millis()
-        );
-
-        let metadata_start = std::time::Instant::now();
-        let mut metadatas = vec![];
-        for (idx, _sub_idx) in &fused {
-            let metadata = metadata_query.query_row((*idx,), |row| row.get::<_, String>(0))?;
-            metadatas.push(metadata);
-        }
-        debug!(
-            "fetching {} metadata took {} ms.",
-            metadatas.len(),
-            metadata_start.elapsed().as_millis()
-        );
-        let total_ms = now.elapsed().as_millis();
-        histogram.record(total_ms.try_into().unwrap());
-        debug!("search took {} ms in total", now.elapsed().as_millis());
-
-        write!(writer, "{}\t", key).unwrap();
-        for metadata in &metadatas {
-            let data: CorpusMetaData = serde_json::from_str(metadata)?;
-            write!(writer, "{},", data.key).unwrap();
-        }
-        writeln!(writer).unwrap();
-        writer.flush().unwrap();
+        wc.add_document(&uuid, None, HashMap::new(), &body, Some(lens))
+            .await?;
+        count += 1;
     }
-    if embedder.is_some() {
-        println!("p95 embedder latency = {} ms", embedder_histogram.p95());
-    }
-    println!("p95 total search latency = {} ms", histogram.p95());
-    Ok(())
-}
-
-fn main() -> Result<()> {
-    let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(LevelFilter::Info));
-
-    let args: Vec<String> = env::args().collect();
-    let assets = std::path::PathBuf::from("assets");
-    let db_name = std::path::PathBuf::from("mydb.sqlite");
-
-    if args.len() == 3 && args[1] == "readcsv" {
-        let mut db = DB::new(db_name).unwrap();
-        let csvname = &args[2];
-        read_csv(&mut db, csvname.into()).unwrap();
-    } else if args.len() == 2 && &args[1] == "embed" {
-        let device = witchcraft::make_device();
-        let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();
-        let db = DB::new(db_name).unwrap();
-        let _got = witchcraft::embed_chunks(&db, &embedder, None).unwrap();
-    } else if args.len() == 2 && &args[1] == "index" {
-        let device = witchcraft::make_device();
-        let db = DB::new(db_name).unwrap();
-        witchcraft::index_chunks(&db, &device).unwrap();
-    } else if args.len() == 2 && &args[1] == "reindex" {
-        let device = witchcraft::make_device();
-        let db = DB::new(db_name).unwrap();
-        witchcraft::full_index(&db, &device).unwrap();
-    } else if args.len() >= 3 && (args[1] == "query" || args[1] == "hybrid") {
-        let device = witchcraft::make_device();
-        let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();
-        let mut cache = witchcraft::EmbeddingsCache::new(1);
-        let db = DB::new_reader(db_name).unwrap();
-        let q = &args[2..].join(" ");
-        let use_fulltext = args[1] == "hybrid";
-        let results =
-            witchcraft::search(&db, &embedder, &mut cache, q, 0.7, 10, use_fulltext, None).unwrap();
-        for (score, _metadata, bodies, sub_idx, _date) in results {
-            let idx = (sub_idx as usize).min(bodies.len().saturating_sub(1));
-            let body = &bodies[idx];
-            println!("{score}: {body} @ {sub_idx}");
-            println!("=============================================");
-        }
-    } else if args.len() >= 4
-        && (args[1] == "querycsv" || args[1] == "hybridcsv" || args[1] == "fulltextcsv")
-    {
-        let db = DB::new_reader(db_name).unwrap();
-        let use_fulltext = args[1] == "hybridcsv" || args[1] == "fulltextcsv";
-        let embedder = if args[1] != "fulltextcsv" {
-            let device = witchcraft::make_device();
-            Some(witchcraft::Embedder::new(&device, &assets).unwrap())
-        } else {
-            None
-        };
-        let csvname = &args[2];
-        let outputname = &args[3];
-        bulk_search(
-            &db,
-            embedder.as_ref(),
-            csvname.into(),
-            outputname.into(),
-            use_fulltext,
-        )
-        .unwrap();
-    } else if args.len() >= 4 && &args[1] == "score" {
-        let device = witchcraft::make_device();
-        let embedder = witchcraft::Embedder::new(&device, &assets).unwrap();
-        let mut cache = witchcraft::EmbeddingsCache::new(1);
-        let sentences: Vec<String> = std::env::args().skip(3).collect();
-        let scores =
-            witchcraft::score_query_sentences(&embedder, &mut cache, &args[2], &sentences).unwrap();
-        for (i, score) in scores.iter().enumerate() {
-            println!("`{}': score={}", args[3 + i], *score);
-        }
-    } else if args.len() == 2 && &args[1] == "clear" {
-        let mut db = DB::new(db_name).unwrap();
-        db.clear();
-    } else {
-        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | index | reindex | query <text> | hybrid <text> | querycsv <file> <results-file> ***\n", args[0]);
-    };
+    info!("read {} records from {:?}", count, csvname);
     Ok(())
 }

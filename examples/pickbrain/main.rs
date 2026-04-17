@@ -8,7 +8,7 @@ mod claude_code;
 mod codex;
 mod watermark;
 
-use witchcraft::{DB, Embedder};
+use witchcraft::{Filter, MetadataSchema, MetadataValue, Witchcraft};
 
 struct SimpleLogger;
 impl log::Log for SimpleLogger {
@@ -29,17 +29,26 @@ static LOGGER: SimpleLogger = SimpleLogger;
 
 fn db_path() -> PathBuf {
     let home = env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join(".claude/pickbrain.db")
+    PathBuf::from(home).join(".claude/pickbrain.lance")
+}
+
+fn pickbrain_schema() -> MetadataSchema {
+    MetadataSchema::new()
+        .add_string("project", true)
+        .add_string("session_id", true)
+        .add_number("turn", false)
+        .add_string("path", false)
+        .add_string("source", true)
+        .add_string("cwd", false)
 }
 
 fn assets_path() -> PathBuf {
     PathBuf::from(env::var("WARP_ASSETS").unwrap_or_else(|_| "assets".into()))
 }
 
-fn ingest(db_name: &PathBuf) -> Result<bool> {
-    let mut db = DB::new(db_name.clone()).unwrap();
-    let (sessions, memories, authored) = claude_code::ingest_claude_code(&mut db)?;
-    let codex_sessions = codex::ingest_codex(&mut db)?;
+async fn ingest(wc: &mut Witchcraft) -> Result<bool> {
+    let (sessions, memories, authored) = claude_code::ingest_claude_code(wc).await?;
+    let codex_sessions = codex::ingest_codex(wc).await?;
     let total = sessions + memories + authored + codex_sessions;
     if total == 0 {
         eprintln!("No new sessions to ingest.");
@@ -49,14 +58,6 @@ fn ingest(db_name: &PathBuf) -> Result<bool> {
         "ingested {sessions} claude sessions, {codex_sessions} codex sessions, {memories} memory files, {authored} authored files"
     );
     Ok(true)
-}
-
-fn embed_and_index(db: &DB, embedder: &Embedder, device: &candle_core::Device) -> Result<()> {
-    let embedded = witchcraft::embed_chunks(db, embedder, None)?;
-    if embedded > 0 {
-        witchcraft::index_chunks(db, device)?;
-    }
-    Ok(())
 }
 
 // --- Search result data ---
@@ -143,70 +144,49 @@ fn read_turn_at(path: &str, source: &str, tm: &TurnMeta) -> Option<SessionTurn> 
 }
 
 
-fn run_search(
-    db_name: &PathBuf,
-    assets: &PathBuf,
+async fn run_search(
+    wc: &mut Witchcraft,
     q: &str,
     session: Option<&str>,
 ) -> Result<(Vec<SearchResult>, u128)> {
-    use witchcraft::types::*;
-    let device = witchcraft::make_device();
-    let embedder = witchcraft::Embedder::new(&device, assets)?;
-
-    let mut cache = witchcraft::EmbeddingsCache::new(1);
-    let db = DB::new_reader(db_name.clone()).unwrap();
-    let sql_filter = session.map(|id| SqlStatementInternal {
-        statement_type: SqlStatementType::Condition,
-        condition: Some(SqlConditionInternal {
-            key: "$.session_id".to_string(),
-            operator: SqlOperator::Equals,
-            value: Some(SqlValue::String(id.to_string())),
-        }),
-        logic: None,
-        statements: None,
-    });
+    let filter = session.map(|id| Filter::eq("session_id", MetadataValue::String(id.to_string())));
     let now = std::time::Instant::now();
-    let results = witchcraft::search(
-        &db,
-        &embedder,
-        &mut cache,
-        q,
-        0.5,
-        10,
-        true,
-        sql_filter.as_ref(),
-    )?;
+    let results = wc.search(q, 0.5, 10, true, filter.as_ref()).await?;
     let search_ms = now.elapsed().as_millis();
 
     let out: Vec<SearchResult> = results
         .into_iter()
-        .map(|(_score, metadata, bodies, sub_idx, date)| {
-            let meta: serde_json::Value = serde_json::from_str(&metadata).unwrap_or_default();
-            let idx = (sub_idx as usize).min(bodies.len().saturating_sub(1));
-            let turns_arr: Vec<TurnMeta> = meta["turns"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .map(|v| TurnMeta {
-                            role: v["role"].as_str().unwrap_or("").to_string(),
-                            timestamp: v["timestamp"].as_str().unwrap_or("").to_string(),
-                            byte_offset: v["off"].as_u64().unwrap_or(0),
-                            byte_len: v["len"].as_u64().unwrap_or(0),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+        .map(|r| {
+            let idx = (r.matched_sub_idx as usize).min(r.bodies.len().saturating_sub(1));
             SearchResult {
-                timestamp: format_date(&date),
-                project: meta["project"].as_str().unwrap_or("").to_string(),
-                session_id: meta["session_id"].as_str().unwrap_or("").to_string(),
-                turn: meta["turn"].as_u64().unwrap_or(0),
-                path: meta["path"].as_str().unwrap_or("").to_string(),
-                cwd: meta["cwd"].as_str().unwrap_or("").to_string(),
-                source: meta["source"].as_str().unwrap_or("claude").to_string(),
-                bodies,
+                timestamp: format_date(&r.date),
+                project: match r.metadata.get("project") {
+                    Some(MetadataValue::String(s)) => s.clone(),
+                    _ => String::new(),
+                },
+                session_id: match r.metadata.get("session_id") {
+                    Some(MetadataValue::String(s)) => s.clone(),
+                    _ => String::new(),
+                },
+                turn: match r.metadata.get("turn") {
+                    Some(MetadataValue::Number(n)) => *n as u64,
+                    _ => 0,
+                },
+                path: match r.metadata.get("path") {
+                    Some(MetadataValue::String(s)) => s.clone(),
+                    _ => String::new(),
+                },
+                cwd: match r.metadata.get("cwd") {
+                    Some(MetadataValue::String(s)) => s.clone(),
+                    _ => String::new(),
+                },
+                source: match r.metadata.get("source") {
+                    Some(MetadataValue::String(s)) => s.clone(),
+                    _ => "claude".to_string(),
+                },
+                bodies: r.bodies,
                 match_idx: idx,
-                turns: turns_arr,
+                turns: vec![], // Turns metadata not stored as flat columns; could be reconstructed from JSONL if needed
             }
         })
         .collect();
@@ -220,13 +200,12 @@ enum View {
     Detail(usize),
 }
 
-fn search_tui(
-    db_name: &PathBuf,
-    assets: &PathBuf,
+async fn search_tui(
+    wc: &mut Witchcraft,
     q: &str,
     session: Option<&str>,
 ) -> Result<Option<(String, String, String)>> {
-    let (results, search_ms) = run_search(db_name, assets, q, session)?;
+    let (results, search_ms) = run_search(wc, q, session).await?;
     if results.is_empty() {
         eprintln!("no results");
         return Ok(None);
@@ -678,13 +657,12 @@ fn truncate(s: &str, max: usize) -> String {
 
 // --- Plain text fallback (piped output) ---
 
-fn search_plain(
-    db_name: &PathBuf,
-    assets: &PathBuf,
+async fn search_plain(
+    wc: &mut Witchcraft,
     q: &str,
     session: Option<&str>,
 ) -> Result<()> {
-    let (results, search_ms) = run_search(db_name, assets, q, session)?;
+    let (results, search_ms) = run_search(wc, q, session).await?;
 
     let mut buf = Vec::new();
     writeln!(buf, "\n[[ {q} ]]")?;
@@ -782,23 +760,48 @@ fn parse_range(s: &str) -> (usize, usize) {
     }
 }
 
-fn dump(db_name: &PathBuf, session_id: &str, turns_range: Option<&str>) -> Result<()> {
-    let db = DB::new_reader(db_name.clone()).unwrap();
+async fn dump(wc: &mut Witchcraft, session_id: &str, turns_range: Option<&str>) -> Result<()> {
+    use futures::TryStreamExt;
+    use lancedb::query::{ExecutableQuery, QueryBase, Select};
 
     let (turn_start, turn_end) = turns_range.map(parse_range).unwrap_or((0, usize::MAX));
 
-    let mut stmt = db.query(
-        "SELECT date, body, json_extract(metadata, '$.turn') as turn
-         FROM document
-         WHERE json_extract(metadata, '$.session_id') = ?1
-         ORDER BY turn",
-    )?;
-    let rows: Vec<(String, String, i64)> = stmt
-        .query_map((session_id,), |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
+    let filter = format!("session_id = '{}'", session_id);
+    let batches = wc.table_ref()
+        .query()
+        .only_if(&filter)
+        .select(Select::Columns(vec![
+            "date".to_string(),
+            "body".to_string(),
+            "sub_idx".to_string(),
+            "turn".to_string(),
+        ]))
+        .execute()
+        .await?
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    // Collect (date, body, turn) and deduplicate by turn (take sub_idx 0)
+    let mut rows: Vec<(String, String, i64)> = Vec::new();
+    for batch in &batches {
+        let date_col = batch.column_by_name("date").and_then(|c| c.as_any().downcast_ref::<arrow_array::StringArray>());
+        let body_col = batch.column_by_name("body").and_then(|c| c.as_any().downcast_ref::<arrow_array::LargeStringArray>());
+        let sub_idx_col = batch.column_by_name("sub_idx").and_then(|c| c.as_any().downcast_ref::<arrow_array::UInt32Array>());
+        let turn_col = batch.column_by_name("turn").and_then(|c| c.as_any().downcast_ref::<arrow_array::Float64Array>());
+
+        if let (Some(dates), Some(bodies), Some(sub_idxs), Some(turns)) = (date_col, body_col, sub_idx_col, turn_col) {
+            for i in 0..batch.num_rows() {
+                if sub_idxs.value(i) == 0 { // Only take first sub-chunk per turn
+                    rows.push((
+                        dates.value(i).to_string(),
+                        bodies.value(i).to_string(),
+                        turns.value(i) as i64,
+                    ));
+                }
+            }
+        }
+    }
+    rows.sort_by_key(|(_, _, t)| *t);
 
     if rows.is_empty() {
         eprintln!("No session found for {session_id}");
@@ -839,7 +842,8 @@ fn dump(db_name: &PathBuf, session_id: &str, turns_range: Option<&str>) -> Resul
     Ok(())
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(LevelFilter::Warn));
 
     let args: Vec<String> = env::args().skip(1).collect();
@@ -853,7 +857,8 @@ fn main() -> Result<()> {
             "--nuke" => {
                 let db_name = db_path();
                 if db_name.exists() {
-                    std::fs::remove_file(&db_name)?;
+                    // Remove the lance directory
+                    std::fs::remove_dir_all(&db_name).ok();
                     eprintln!("removed {}", db_name.display());
                 } else {
                     eprintln!("no database to remove");
@@ -879,14 +884,14 @@ fn main() -> Result<()> {
 
     let db_name = db_path();
     let assets = assets_path();
+    let schema = pickbrain_schema();
 
-    match ingest(&db_name) {
+    let mut wc = Witchcraft::new(&db_name, &assets, schema).await?;
+
+    match ingest(&mut wc).await {
         Ok(have_changes) => {
             if have_changes {
-                let db_rw = DB::new(db_name.clone()).unwrap();
-                let device = witchcraft::make_device();
-                let embedder = witchcraft::Embedder::new(&device, &assets)?;
-                embed_and_index(&db_rw, &embedder, &device)?;
+                wc.build_index().await?;
             }
         },
         Err(e) => {
@@ -896,16 +901,16 @@ fn main() -> Result<()> {
     }
 
     if let Some(ref sid) = dump_session {
-        dump(&db_name, sid, turns_range.as_deref())?;
+        dump(&mut wc, sid, turns_range.as_deref()).await?;
     } else if !query_args.is_empty() {
         let q = query_args.join(" ");
         use std::io::IsTerminal;
         if std::io::stdout().is_terminal() {
-            if let Some((sid, path, source)) = search_tui(&db_name, &assets, &q, session_filter.as_deref())? {
+            if let Some((sid, path, source)) = search_tui(&mut wc, &q, session_filter.as_deref()).await? {
                 launch_resume(&sid, &path, &source)?;
             }
         } else {
-            search_plain(&db_name, &assets, &q, session_filter.as_deref())?;
+            search_plain(&mut wc, &q, session_filter.as_deref()).await?;
         }
     } else {
         eprintln!("Usage: pickbrain [--session UUID] <query>");
